@@ -5,11 +5,22 @@
 
 class LeafNode : public Node {
 public:
-	__host__ __device__ LeafNode();
-	__host__ __device__ void setObjectID(int id);
-	__host__ __device__ int getObjectID();
+	__host__ __device__ LeafNode()
+:
+	Node(LEAFNODE, -1),
+	_ObjID(0)
+	{}
+
+	__host__ __device__ void SetObjID(int id) {
+		_ObjID = id;
+	}
+
+	__host__ __device__ int GetObjID() {
+		return _ObjID;
+	}
+
 private:
-	int objID;
+	int _ObjID;
 };
 
-#endif // !LEAFNODE_CUH_
+#endif

@@ -1,0 +1,2 @@
+[WarpWatch]
+Expressions=iBBoxs, iSortedObjectIDs[idx], iBBoxs + iSortedObjectIDs[idx]

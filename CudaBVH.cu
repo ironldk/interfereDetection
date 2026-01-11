@@ -1,11 +1,343 @@
 #include "CudaBVH.cuh"
+#include <cub/util_allocator.cuh>
+using std::cout;
+using std::endl;
 
-__device__ int findSplit(HashType* sortedMortonCodes, int first, int last) {
+cub::CachingDeviceAllocator g_allocator(true);
+
+CudaBVH::CudaBVH(std::vector<Triangle>* iTris, int iSampleSize,
+	int iThreadsPerBlock, float iMatrixModel[16], float3* oGL_d_mesh, float3* oGL_d_box)
+:
+	_SampleSize(iSampleSize),
+	_ThreadsPerBlock(iThreadsPerBlock),
+	h_myMesh(iTris),
+	d_mesh(nullptr),
+	d_BBoxLeaf(nullptr),
+	d_BBoxInner(nullptr),
+	d_leafNodes(nullptr),
+	d_internalNodes(nullptr)
+{
+// generate morton code
+	cub::DoubleBuffer<HashType> d_sortedKeys;
+	cub::DoubleBuffer<int> d_sortedValues;
+	CubDebugExit(g_allocator.DeviceAllocate((void**)&d_sortedKeys.d_buffers[0], sizeof(HashType) * _SampleSize));
+	CubDebugExit(g_allocator.DeviceAllocate((void**)&d_sortedKeys.d_buffers[1], sizeof(HashType) * _SampleSize));
+	CubDebugExit(g_allocator.DeviceAllocate((void**)&d_sortedValues.d_buffers[0], sizeof(int) * _SampleSize));
+	CubDebugExit(g_allocator.DeviceAllocate((void**)&d_sortedValues.d_buffers[1], sizeof(int) * _SampleSize));
+
+
+	HashType* d_objKeys = d_sortedKeys.Current();
+	int* d_objValues = d_sortedValues.Current();
+	d_mesh = reinterpret_cast<Triangle*>(oGL_d_mesh);
+	d_BBoxLeaf = reinterpret_cast<BBox*>(oGL_d_box);
+	d_BBoxInner = reinterpret_cast<BBox*>(oGL_d_box) + _SampleSize;
+	float *d_matrixModel = nullptr;
+	cudaMalloc((void**)&d_matrixModel, 16*sizeof(float));
+	cudaMemcpy(d_mesh, &(*h_myMesh)[0], _SampleSize * sizeof(Triangle), cudaMemcpyHostToDevice);
+	cudaMemcpy(d_matrixModel, iMatrixModel, 16 * sizeof(float), cudaMemcpyHostToDevice);
+
+	cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start);
+	GenerateBBox<<<(_SampleSize+_ThreadsPerBlock-1)/_ThreadsPerBlock, _ThreadsPerBlock>>>
+		(_SampleSize, d_mesh, d_BBoxLeaf, d_matrixModel);
+	Morton3DCuda<<<(_SampleSize+_ThreadsPerBlock-1)/_ThreadsPerBlock, _ThreadsPerBlock>>>
+		(_SampleSize, d_BBoxLeaf, d_objKeys, d_objValues);
+	cudaEventRecord(stop);
+	cudaDeviceSynchronize();
+
+	float milliseconds = 0;
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+	CUDA_DEBUG_PRINT("It took me %f milliseconds to generate morton codes.\n", milliseconds);
+
+	cudaFree(d_matrixModel);
+	d_matrixModel = nullptr;
+
+// Radix sort
+	// Allocate temporary storage
+	size_t temp_storage_bytes = 0;
+	void* d_temp_storage = nullptr;
+
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start);
+	CubDebugExit(cub::DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes, d_sortedKeys, d_sortedValues, _SampleSize));
+	CubDebugExit(g_allocator.DeviceAllocate(&d_temp_storage, temp_storage_bytes));
+	CubDebugExit(cub::DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes, d_sortedKeys, d_sortedValues, _SampleSize));
+	cudaEventRecord(stop);
+
+	CubDebugExit(g_allocator.DeviceFree(d_temp_storage));
+	d_objKeys = d_sortedKeys.Current();
+	d_objValues = d_sortedValues.Current();
+
+
+	cudaEventSynchronize(stop);
+	milliseconds = 0;
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+	CUDA_DEBUG_PRINT("It took me %f milliseconds to run parallel radix sort.\n", milliseconds);
+
+// Generate Hierachy
+	// Construct leaf nodes.
+	// Note: This step can be avoided by storing the tree in a slightly different way.
+	cudaMalloc((void**)&d_leafNodes, _SampleSize * sizeof(LeafNode));
+	cudaMalloc((void**)&d_internalNodes, (_SampleSize - 1) * sizeof(InternalNode));
+
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start);
+	AssignLeafNodes<<<(_SampleSize+_ThreadsPerBlock-1)/_ThreadsPerBlock, _ThreadsPerBlock>>>
+		(_SampleSize, d_leafNodes, d_internalNodes, d_objValues, d_BBoxLeaf);
+	cudaDeviceSynchronize();
+	AssignInternalNodes<<<(_SampleSize+_ThreadsPerBlock-1)/_ThreadsPerBlock, _ThreadsPerBlock>>>
+		(_SampleSize, d_leafNodes, d_internalNodes, d_objKeys);
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	milliseconds = 0;
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+	CUDA_DEBUG_PRINT("It took me %f milliseconds to generate hierachy.\n", milliseconds);
+
+	CubDebugExit(g_allocator.DeviceFree(d_sortedKeys.d_buffers[0]));
+	CubDebugExit(g_allocator.DeviceFree(d_sortedKeys.d_buffers[1]));
+	CubDebugExit(g_allocator.DeviceFree(d_sortedValues.d_buffers[0]));
+	CubDebugExit(g_allocator.DeviceFree(d_sortedValues.d_buffers[1]));
+
+// Assign bounding box to internal nodes
+	int* d_ReadyFlags = nullptr;
+	cudaMalloc((void**)&d_ReadyFlags, (_SampleSize - 1) * sizeof(int));
+	cudaMemset(d_ReadyFlags, 0, (_SampleSize - 1) * sizeof(int));
+
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+	cudaEventRecord(start);
+	InternalNodeBBox<<<(_SampleSize+_ThreadsPerBlock-1)/_ThreadsPerBlock, _ThreadsPerBlock>>>
+		(_SampleSize, d_leafNodes, d_internalNodes, d_BBoxInner, d_ReadyFlags);
+	CompleteBBox<<<(_SampleSize+_ThreadsPerBlock-1)/_ThreadsPerBlock, _ThreadsPerBlock>>>
+		(_SampleSize, d_BBoxLeaf, d_BBoxInner);
+	cudaEventRecord(stop);
+	cudaEventSynchronize(stop);
+	milliseconds = 0;
+	cudaEventElapsedTime(&milliseconds, start, stop);
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+	CUDA_DEBUG_PRINT("It took me %f milliseconds to assign bounding box.\n", milliseconds);
+
+	cudaFree(d_ReadyFlags);
+	d_ReadyFlags = nullptr;
+}
+
+CudaBVH::~CudaBVH() {
+	h_myMesh = nullptr;
+	d_mesh = nullptr;
+	d_BBoxLeaf = nullptr;
+	d_BBoxInner = nullptr;
+	cudaFree(d_leafNodes);
+	cudaFree(d_internalNodes);
+	d_leafNodes = nullptr;
+	d_internalNodes = nullptr;
+}
+
+__global__ void GenerateBBox(int iSampleSize, Triangle* iTriangle, BBox* oBBoxLeaf, float iMatrixModel[16]) {
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+	if (idx >= iSampleSize) {
+		return;
+	}
+	iTriangle[idx].Transform(iMatrixModel);
+	new(&oBBoxLeaf[idx]) BBox(iTriangle[idx]);
+
+#ifdef DEBUG
+	if (idx < 50) {
+		CUDA_DEBUG_PRINT("idx=%d, &iTriangle[idx]=%p, &oBBoxLeaf[idx]=%p\n",
+			idx, &iTriangle[idx], &oBBoxLeaf[idx]);
+	}
+#endif
+}
+
+__global__ void Morton3DCuda(int iSampleSize, const BBox* iBBoxs, HashType* oMCode, int* oObjectIDs) {
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+	if (idx < iSampleSize) {
+		float x, y, z;
+		iBBoxs[idx].GetCenter(x, y, z);
+#if HASH_64
+		float xx = x * 1024.0f * 1024.0f;
+		float yy = y * 1024.0f * 1024.0f;
+		float zz = z * 1024.0f * 1024.0f;
+#else
+		_x = _x * 1023.0f;
+		_y = _y * 1023.0f;
+		_z = _z * 1023.0f;
+#endif
+		HashType ex = ExpandBits((HashType)((double)xx));
+		HashType ey = ExpandBits((HashType)((double)yy));
+		HashType ez = ExpandBits((HashType)((double)zz));
+		oMCode[idx] = ((ex << 2) + (ey << 1) + ez);		// é˜²æ­¢Mortonç é‡å¤
+		oObjectIDs[idx] = idx;
+	}
+}
+
+#if HASH_64
+// Expand a 21-bit integer into 63 bits by inserting 2 zeros before each bit.
+__device__ HashType ExpandBits(HashType iv) {
+	//iv0b0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0001'1111'1111'1111'1111'1111u;
+
+	iv = (iv *
+		0b0000'0000'0000'0000'0000'0000'0000'0001'0000'0000'0000'0000'0000'0000'0000'0001u) &
+		0b1111'1111'1111'1111'0000'0000'0000'0000'0000'0000'0000'0000'1111'1111'1111'1111u;
+	//iv0b0000'0000'0001'1111'0000'0000'0000'0000'0000'0000'0000'0000'1111'1111'1111'1111u;
+
+	iv = (iv *
+		0b0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0001'0000'0000'0000'0001u) &
+		0b0000'0000'1111'1111'0000'0000'0000'0000'1111'1111'0000'0000'0000'0000'1111'1111u;
+	//iv0b0000'0000'0001'1111'0000'0000'0000'0000'1111'1111'0000'0000'0000'0000'1111'1111u;
+
+	iv = (iv *
+		0b0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0001'0000'0001u) &
+		0b1111'0000'0000'1111'0000'0000'1111'0000'0000'1111'0000'0000'1111'0000'0000'1111u;
+	//iv0b0001'0000'0000'1111'0000'0000'1111'0000'0000'1111'0000'0000'1111'0000'0000'1111u;
+
+	iv = (iv *
+		0b0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0001'0001u) &
+		0b0011'0000'1100'0011'0000'1100'0011'0000'1100'0011'0000'1100'0011'0000'1100'0011u;
+	//iv0b0001'0000'1100'0011'0000'1100'0011'0000'1100'0011'0000'1100'0011'0000'1100'0011u;
+
+	iv = (iv *
+		0b0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0000'0101u) &
+		0b1001'0010'0100'1001'0010'0100'1001'0010'0100'1001'0010'0100'1001'0010'0100'1001u;
+	//iv0b0001'0010'0100'1001'0010'0100'1001'0010'0100'1001'0010'0100'1001'0010'0100'1001u;
+
+	return iv;
+}
+#else
+__device__ HashType ExpandBits(HashType iv) {
+	iv = (iv * 0x00010001u) &
+		0xFF0000FFu;
+	iv = (iv * 0x00000101u) &
+		0x0F00F00Fu;
+	iv = (iv * 0x00000011u) &
+		0xC30C30C3u;
+	iv = (iv * 0x00000005u) &
+		0x49249249u;
+	return iv;
+}
+#endif
+
+__global__ void AssignLeafNodes(int iSampleSize, LeafNode* ipLeafNodes,
+	InternalNode* ipInternalNodes, int* iSortedObjectIDs, BBox* iBBoxLeaf) {
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+	if (idx < iSampleSize) {
+		new(&ipLeafNodes[idx]) LeafNode();
+		if (idx < iSampleSize - 1) {
+			new(&ipInternalNodes[idx]) InternalNode();
+		}
+		ipLeafNodes[idx].SetObjID(iSortedObjectIDs[idx]);
+		ipLeafNodes[idx].SetBBox(&iBBoxLeaf[iSortedObjectIDs[idx]]);
+
+#ifdef DEBUG
+		if (idx < 50) {
+			const BBox* pBBox = ipLeafNodes[idx].GetBBox();
+			CUDA_DEBUG_PRINT("iSampleSize=%d, iBBoxLeaf=%p, iSortedObjectIDs[%d]=%d, &iBBoxLeaf[iSortedObjectIDs[%d]]=%p, pBBox=%p\n",
+				iSampleSize, iBBoxLeaf, idx, iSortedObjectIDs[idx], idx, &iBBoxLeaf[iSortedObjectIDs[idx]], pBBox);
+		}
+#endif
+	}
+}
+
+__global__ void AssignInternalNodes(int iSampleSize, LeafNode* ipLeafNodes,
+	InternalNode* ipInternalNodes, HashType* iSortedMortons)
+{
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+	if (idx < iSampleSize - 1) {
+		int2 range = DetermineRange(iSortedMortons, iSampleSize, idx);
+		// Determine where to split the range.
+		int split = FindSplit(iSortedMortons, range.x, range.y);
+
+		Node *childL = nullptr, *childR = nullptr;
+		NodeType childTypeL, childTypeR;
+		// Select childL.
+		if (split == range.x) {
+			childL = &ipLeafNodes[split];
+			childTypeL = LEAFNODE;
+		} else {
+			childL = &ipInternalNodes[split];
+			childTypeL = INTERNALNODE;
+		}
+		// Select childR.
+		if (split + 1 == range.y) {
+			childR = &ipLeafNodes[split + 1];
+			childTypeR = LEAFNODE;
+		} else {
+			childR = &ipInternalNodes[split + 1];
+			childTypeR = INTERNALNODE;
+		}
+		// Record parent-child relationships.
+		ipInternalNodes[idx].SetChildL(split, childTypeL);
+		ipInternalNodes[idx].SetChildR(split + 1, childTypeR);
+		childL->SetParentID(idx);
+		childR->SetParentID(idx);
+
+#ifdef DEBUG
+		if (idx < 50) {
+			const BBox* pBBox = ipLeafNodes[idx].GetBBox();
+			CUDA_DEBUG_PRINT("iSampleSize=%d, iSortedMortons[%d]=%llu, pBBox=%p\n",
+				iSampleSize, idx, iSortedMortons[idx], pBBox);
+		}
+#endif
+	}
+}
+
+__device__ int2 DetermineRange(HashType* iSortedMortons, int iNumObjects, int idx) {
+	// d should only take the value of 1 or -1
+	int dir = Sign(CommonLeadingBits(iSortedMortons, idx, idx + 1, iNumObjects) -
+		CommonLeadingBits(iSortedMortons, idx, idx - 1, iNumObjects));
+	int dmin = CommonLeadingBits(iSortedMortons, idx, idx - dir, iNumObjects);
+	int lmax = 2;
+	while (CommonLeadingBits(iSortedMortons, idx, idx + lmax * dir, iNumObjects) > dmin) {
+		lmax = lmax * 2;
+	}
+	int l = 0;
+	for (int t = lmax / 2; t >= 1; t /= 2) {
+		if (CommonLeadingBits(iSortedMortons, idx, idx + (l + t) * dir, iNumObjects) > dmin) {
+			l += t;
+		}
+	}
+	int j = idx + l * dir;
+	if (dir > 0) {
+		return int2{ idx, j };
+	} else {
+		return int2{ j, idx };
+	}
+}
+
+__device__ int Sign(int ix) {
+	return (ix > 0) - (ix < 0);
+}
+
+// number of common leading bits of two codes
+__device__ int CommonLeadingBits(HashType* iSortedMortons, int ix, int iy, int iNumObjects) {
+	if (ix >= 0 && ix < iNumObjects && iy >= 0 && iy < iNumObjects) {
+#if HASH_64
+		return __clzll(iSortedMortons[ix] ^ iSortedMortons[iy]);
+#else
+		return __clz(iSortedMortons[ix] ^ iSortedMortons[iy]);
+#endif
+	}
+	return -1;
+}
+
+// Return the highest position that shares more than commonPrefix bits
+__device__ int FindSplit(HashType* iSortedMortons, int iFirst, int iLast) {
 	// Identical Morton codes => split the range in the middle.
-	HashType firstCode = sortedMortonCodes[first];
-	HashType lastCode = sortedMortonCodes[last];
-	if (firstCode == lastCode)
-		return (first + last) >> 1;
+	HashType firstCode = iSortedMortons[iFirst];
+	HashType lastCode = iSortedMortons[iLast];
+	if (firstCode == lastCode) {
+		return (iFirst + iLast) >> 1;
+	}
 	// Calculate the number of highest bits that are the same
 	// for all objects, using the count-leading-zeros intrinsic.
 #if HASH_64
@@ -16,243 +348,83 @@ __device__ int findSplit(HashType* sortedMortonCodes, int first, int last) {
 	// Use binary search to find where the next bit differs.
 	// Specifically, we are looking for the highest object that
 	// shares more than commonPrefix bits with the first one.
-	int split = first; // initial guess
-	int step = last - first;
+	int split = iFirst; // initial guess
+	int step = iLast - iFirst;
 	do {
 		step = (step + 1) >> 1; // exponential decrease
 		int newSplit = split + step; // proposed new position
-		if (newSplit < last) {
-			HashType splitCode = sortedMortonCodes[newSplit];
+		if (newSplit < iLast) {
+			HashType splitCode = iSortedMortons[newSplit];
 #if HASH_64
 			int splitPrefix = __clzll(firstCode ^ splitCode);
 #else
 			int splitPrefix = __clz(firstCode ^ splitCode);
 #endif
-			if (splitPrefix > commonPrefix)
+			if (splitPrefix > commonPrefix) {
 				split = newSplit; // accept proposal
+			}
 		}
 	} while (step > 1);
 	return split;
 }
 
-// number of common leading bits of two codes
-__device__ int delta(HashType* sortedMortonCodes, int x, int y, int numObjects){
-	if (x>=0 && x<numObjects && y>=0 && y<numObjects) {
-#if HASH_64
-		return __clzll(sortedMortonCodes[x] ^ sortedMortonCodes[y]);
-#else
-		return __clz(sortedMortonCodes[x] ^ sortedMortonCodes[y]);
-#endif
-	}
-	return -1;
-}
-
-__device__ int sign(int x) { return (x > 0) - (x < 0); }
-
-__device__ int2 determineRange(HashType* sortedMortonCodes,
-	int numObjects, int idx)
-{
-	int d = sign(delta(sortedMortonCodes, idx, idx + 1, numObjects) -
-		delta(sortedMortonCodes, idx, idx - 1, numObjects));
-	int dmin = delta(sortedMortonCodes, idx, idx - d, numObjects);
-	int lmax = 2;
-	while (delta(sortedMortonCodes, idx, idx + lmax * d, numObjects) > dmin)
-		lmax = lmax * 2;
-	int l = 0; 
-	for (int t = lmax / 2; t >= 1; t /= 2) {
-		if (delta(sortedMortonCodes, idx, idx + (l + t) * d, numObjects) > dmin)
-			l += t;
-	}
-	int j = idx + l * d;
-	int2 range;
-	range.x = min(idx, j);
-	range.y = max(idx, j);
-	if (idx == 38043 || idx == 38044 || idx == 38045 || idx == 38046 ||
-		idx == 38047 || idx == 38048)
-		printf("idx %d range :%d - %d j: %d morton: %d\n",
-			idx, range.x, range.y, j, sortedMortonCodes[idx]);
-	return range;
-}
-
-#if HASH_64
-__device__ HashType expandBits(HashType v) {
-	v = (v * 0x000100000001u) & 0xFFFF00000000FFFFu;
-	v = (v * 0x000000010001u) & 0x00FF0000FF0000FFu;
-	v = (v * 0x000000000101u) & 0xF00F00F00F00F00Fu;
-	v = (v * 0x000000000011u) & 0x30C30C30C30C30C3u;
-	v = (v * 0x000000000005u) & 0x9249249249249249u;
-	return v;
-}
-#else
-__device__ HashType expandBits(HashType v) {
-	v = (v * 0x00010001u) & 0xFF0000FFu;
-	v = (v * 0x00000101u) & 0x0F00F00Fu;
-	v = (v * 0x00000011u) & 0xC30C30C3u;
-	v = (v * 0x00000005u) & 0x49249249u;
-	return v;
-}
-#endif
-
-
-__global__ void assignInternalNodes(int SAMPLE_SIZE, HashType* sortedMortonCodes,
-	LeafNode* leafNodes, InternalNode* internalNodes, int* sortedObjectIDs)
-{
-	int idx = threadIdx.x + blockDim.x * blockIdx.x;
-	if (idx < SAMPLE_SIZE - 1) {
-		int2 range = determineRange(sortedMortonCodes, SAMPLE_SIZE, idx);
-		int first = range.x;
-		int last = range.y;
-		// Determine where to split the range.
-		int split = findSplit(sortedMortonCodes, first, last);
-		// Select childA.
-		Node* childA;
-		int childAIdx;
-		NodeType childAType;
-		if (split == first) {
-			childA = &leafNodes[split];
-			childAIdx = split;
-			childAType = LEAFNODE;
-		}
-		else {
-			childA = &internalNodes[split];
-			childAIdx = split;
-			childAType = INTERNALNODE;
-		}
-		// Select childB.
-		Node* childB;
-		int childBIdx;
-		NodeType childBType;
-		if (split + 1 == last) {
-			childB = &leafNodes[split + 1];
-			childBIdx = split + 1;
-			childBType = LEAFNODE;
-		}
-		else {
-			childB = &internalNodes[split + 1];
-			childBIdx = split + 1;
-			childBType = INTERNALNODE;
-		}
-		// Record parent-child relationships.
-		//internalNodes[idx].setType();
-		internalNodes[idx].setLeftNode(childAIdx, childAType);
-		internalNodes[idx].setRightNode(childBIdx, childBType);
-		internalNodes[idx].setIdx(idx);
-		// the initialization is moved outside
-		// and using constructors to avoid overwrite
-//         if (0)        {
-//             //         if ()
-//             //             internalNodes[idx].setParent(-1, NODE);
-//         }
-		childA->setParent(idx, INTERNALNODE);
-		childB->setParent(idx, INTERNALNODE);
-		//printf("%d %d %d %d %d %d\n",
-		//idx, first, last, split, childA->getParent(), childB->getParent());
-	}
-}
-
-#if 0
-__global__ void morton3DCuda(int SAMPLE_SIZE, HashType* c, const BBox* objects) {
-	int idx = threadIdx.x + blockDim.x * blockIdx.x;
-	if (idx < SAMPLE_SIZE) {
-		float x, y, z;
-		x = (objects[idx]._max.x + objects[idx]._min.x) / 2;
-		y = (objects[idx]._max.y + objects[idx]._min.y) / 2;
-		z = (objects[idx]._max.z + objects[idx]._min.z) / 2;
-		x = fmin(fmax(x * 1024.0f, 0.0f), 1023.0f);
-		y = fmin(fmax(y * 1024.0f, 0.0f), 1023.0f);
-		z = fmin(fmax(z * 1024.0f, 0.0f), 1023.0f);
-		HashType xx = expandBits((HashType)x);
-		HashType yy = expandBits((HashType)y);
-		HashType zz = expandBits((HashType)z);
-		c[idx] = xx * 4 + yy * 2 + zz;
-	}
-}
-#else
-__device__ MortonRec::MortonRec(int sample_size, const BBox& bbox, int idx) {
-	bool needprint = idx >= 38040 && idx <= 38050;
-	bbox.GetCenter(x, y, z);
-	//if (needprint) printf("idx: %d  x: %f\n", idx, x);
-	//if (needprint) printf("idx: %d  y: %f\n", idx, y);
-	//if (needprint) printf("idx: %d  z: %f\n", idx, z);
-#if HASH_64
-	xx = x * 1024.0f * 1024.0f;
-	//if (needprint) printf("idx: %d  xx: %f\n", idx, x);
-	yy = y * 1024.0f * 1024.0f;
-	//if (needprint) printf("idx: %d  yy: %f\n", idx, y);
-	zz = z * 1024.0f * 1024.0f;
-	//if (needprint) printf("idx: %d  zz: %f\n", idx, z);
-#else
-	x = x * 1023.0f;  //if (needprint) printf("idx: %d  xx: %f\n", idx, x);
-	y = y * 1023.0f;  //if (needprint) printf("idx: %d  yy: %f\n", idx, y);
-	z = z * 1023.0f;  //if (needprint) printf("idx: %d  zz: %f\n", idx, z);
-#endif
-	ex = expandBits((HashType)((double)xx));
-	//if (needprint) printf("idx: %d  expand x: %d\n", idx, xx);
-	ey = expandBits((HashType)((double)yy));
-	//if (needprint) printf("idx: %d  expand y: %d\n", idx, yy);
-	ez = expandBits((HashType)((double)zz));
-	//if (needprint) printf("idx: %d  expand z: %d\n", idx, zz);
-	m = (ex * 4 + ey * 2 + ez) * sample_size + idx;		// ·ÀÖ¹MortonÂëÖØ¸´
-	//if (needprint) printf("idx: %d  hash: %d\n", idx, c[idx]);
-}
-
-__global__ void morton3DCuda(int SAMPLE_SIZE, HashType* c, const BBox* objects,
-	MortonRec* mor)
-{
-	int idx = threadIdx.x + blockDim.x * blockIdx.x;
-	if (idx < SAMPLE_SIZE) {
-		mor[idx] = MortonRec(SAMPLE_SIZE, objects[idx], idx);
-		c[idx] = mor[idx].m;
-	}
-}
-#endif
-
-__global__ void valuesKernel(int SAMPLE_SIZE, int* keys) {
+__global__ void ValuesKernel(int iSampleSize, int* keys) {
 	int index = threadIdx.x + blockDim.x * blockIdx.x;
-	if (index < SAMPLE_SIZE)
+	if (index < iSampleSize) {
 		keys[index] = index;
-}
-
-__global__ void internalNodeBBox(int SAMPLE_SIZE, int* atom,
-	InternalNode* internalNodes, LeafNode* leafNodes, BBox* d_myBBox)
-{
-	int idx = threadIdx.x + blockDim.x * blockIdx.x;
-	if (idx < SAMPLE_SIZE) {
-		Node* ptr = &leafNodes[idx];
-		InternalNode* parent = &internalNodes[ptr->getParent()];
-		while (parent->getIdx() < SAMPLE_SIZE - 1 && parent->getIdx() > -1 &&
-			atomicCAS(&atom[parent->getIdx()], 0, 1) == 1)
-		{
-			BBox leftBox, rightBox;
-			//printf("In while %d\n", parent->getIdx());
-			if (parent->leftNodeType() == INTERNALNODE) {
-				leftBox = internalNodes[parent->leftNodeIdx()].getBBox();
-			} else {
-				leftBox = leafNodes[parent->leftNodeIdx()].getBBox();
-			}
-			BBox buf(FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX, FLT_MAX, -FLT_MAX);
-			buf.MakeEnvelope(leftBox);
-			buf.MakeEnvelope(rightBox);
-
-			parent->setBBox(buf);
-			ptr = parent;
-			if (ptr->getParent() > -1/* && ptr->getParent() < SAMPLE_SIZE - 1*/)
-				parent = &internalNodes[ptr->getParent()];
-			else return;
-		}
 	}
 }
 
-__global__ void assignLeafNodes
-	(int SAMPLE_SIZE, LeafNode* leafNodes, int* sortedObjectIDs, BBox* bbox)
+__global__ void InternalNodeBBox(int iSampleSize, LeafNode* ipLeafNodes,
+	InternalNode* ipInternalNodes, BBox* iBBoxInner, int* iReadyFlags
+)
 {
 	int idx = threadIdx.x + blockDim.x * blockIdx.x;
-	if (idx < SAMPLE_SIZE) {
-		//leafNodes[idx].setType();
-		leafNodes[idx].setIdx(idx);
-		leafNodes[idx].setObjectID(sortedObjectIDs[idx]);
-		leafNodes[idx].setBBox(bbox[sortedObjectIDs[idx]]);
-		//printf("Index: %d ObjectID: %d\n", idx, leafNodes[idx].getObjectID());
+	if (idx >= iSampleSize) {
+		return;
+	}
+	int parentIdx = ipLeafNodes[idx].ParentID();
+	while (parentIdx != -1) {
+		InternalNode* pParent = ipInternalNodes + parentIdx;
+		const BBox *pBoxL = nullptr, *pBoxR = nullptr;
+		if (pParent->ChildTypeL() == INTERNALNODE) {
+			pBoxL = ipInternalNodes[pParent->ChildIdxL()].GetBBox();
+		} else {
+			pBoxL = ipLeafNodes[pParent->ChildIdxL()].GetBBox();
+		}
+		if (pParent->ChildTypeR() == INTERNALNODE) {
+			pBoxR = ipInternalNodes[pParent->ChildIdxR()].GetBBox();
+		} else {
+			pBoxR = ipLeafNodes[pParent->ChildIdxR()].GetBBox();
+		}
+		if (pBoxL && pBoxR) {
+			if (atomicAdd(&iReadyFlags[parentIdx], 1) == 0) {
+				break;
+			}
+			new(&iBBoxInner[parentIdx]) BBox(*pBoxL);
+			iBBoxInner[parentIdx].Union(*pBoxR);
+			pParent->SetBBox(&iBBoxInner[parentIdx]);
+			parentIdx = pParent->ParentID();
+		} else {
+			;
+		}
+	}
+#ifdef DEBUG
+	const BBox* pBBox = ipInternalNodes[idx].GetBBox();
+	if (idx < 50) {
+		CUDA_DEBUG_PRINT("iSampleSize=%d, idx=%d, pBBox=%p\n", iSampleSize, idx, pBBox);
+	}
+#endif
+}
+
+__global__ void CompleteBBox(int iSampleSize, BBox* iBBoxLeaf, BBox* iBBoxInner) {
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+	if (idx >= iSampleSize) {
+		return;
+	}
+	iBBoxLeaf[idx].Complete();
+	if (idx < iSampleSize - 1) {
+		iBBoxInner[idx].Complete();
 	}
 }
 
@@ -332,10 +504,6 @@ __host__ __device__ bool IntersectRayAABB(const float3& start,
 	return true;
 }
 
-__host__ __device__ bool IntersectAABBAABB(const BBox& b, const BBox& a) {
-	return a.Intersect(b);
-}
-
 __host__ __device__ inline float3 cross(const float3& a, const float3& b) {
 	return make_float3(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x);
 }
@@ -387,11 +555,7 @@ __device__ __host__ float3 f3_sclrmult(float val, float3 A) {
 	return res;
 }
 
-__device__ __host__ float f_clamp(float n, float min, float max) {
-	if (n < min) return min;
-	if (n > max) return max;
-	return n;
-}
+
 
 // Moller and Trumbore's method
 __host__ __device__ bool IntersectRayTriTwoSided(
@@ -427,948 +591,116 @@ __host__ __device__ bool IntersectRayTriTwoSided(
 	return true;
 }
 
-__device__ __host__ float edge_to_edge(float3 p1, float3 q1, float3 p2, float3 q2,
-	float& s, float& t, float3& c1, float3& c2) {
-	float3 d1 = f3_sub(q1, p1); // Direction vector of segment S1
-	float3 d2 = f3_sub(q2, p2); // Direction vector of segment S2
-	float3 r = f3_sub(p1, p2);
-	float a = f3_dot(d1, d1); // Squared length of segment S1, always nonnegative
-	float e = f3_dot(d2, d2); // Squared length of segment S2, always nonnegative
-	float f = f3_dot(d2, r);
-	// Check if either or both segments degenerate into points
-	if (a <= EPSILON && e <= EPSILON) {
-		// Both segments degenerate into points
-		s = t = 0.0f;
-		c1 = p1;
-		c2 = p2;
-		float3 c2c1 = f3_sub(c1, c2);
-		return f3_dot(c2c1, c2c1);
-	}
-	if (a <= EPSILON) {
-		// First segment degenerates into a point
-		s = 0.0f;
-		t = f / e; // s = 0 => t = (b*s + f) / e = f / e
-		t = f_clamp(t, 0.0f, 1.0f);
-	}
-	else {
-		float c = f3_dot(d1, r);
-		if (e <= EPSILON) {
-			// Second segment degenerates into a point
-			t = 0.0f;
-			s = f_clamp(-c / a, 0.0f, 1.0f); // t = 0 => s = (b*t - c) / a = -c / a
-		}
-		else {
-			// The general nondegenerate case starts here
-			float b = f3_dot(d1, d2);
-			float denom = a * e - b * b; // Always nonnegative
-			// If segments not parallel, compute closest point on L1 to L2 and
-			// clamp to segment S1. Else pick arbitrary s (here 0)
-			if (denom != 0.0f) {
-				s = f_clamp((b * f - c * e) / denom, 0.0f, 1.0f);
-			}
-			else
-				s = 0.0f;
-			// Compute point on L2 closest to S1(s) using
-			// t = Dot((P1 + D1*s) - P2,D2) / Dot(D2,D2) = (b*s + f) / e
-
-			// If t in [0,1] done. Else clamp t, recompute s for the new value
-			// of t using s = Dot((P2 + D2*t) - P1,D1) / Dot(D1,D1)= (t*b - c) / a
-			// and clamp s to [0, 1]
-			float tnom = b * s + f;
-			if (tnom < 0.0f) {
-				t = 0.0f;
-				s = f_clamp(-c / a, 0.0f, 1.0f);
-			}
-			else if (tnom > e) {
-				t = 1.0f;
-				s = f_clamp((b - c) / a, 0.0f, 1.0f);
-			}
-			else {
-				t = tnom / e;
-			}
-		}
-	}
-	c1 = f3_add(p1, f3_sclrmult(s, d1));
-	c2 = f3_add(p2, f3_sclrmult(t, d2));
-	float3 c2c1 = f3_sub(c1, c2);
-	return f3_dot(c2c1, c2c1);
-}
-
-__device__ __host__ float point_to_triangle
-	(float3 pt, float3& ptt, float3 a, float3 b, float3 c)
+__global__ void intersectKernel(int iSampleSize2, BBox* iBBoxLeaf2, Triangle* iTriangle2, int* oHit2,
+	int* oHit, int iSampleSize, InternalNode* iInternalNodes, LeafNode* iLeafNodes, Triangle* myMesh)
 {
-	// Check if P in vertex region outside A
-	float3 ab = f3_sub(b, a);
-	float3 ac = f3_sub(c, a);
-	float3 ap = f3_sub(pt, a);
-	float d1 = f3_dot(ab, ap);
-	float d2 = f3_dot(ac, ap);
-	if (d1 <= 0.0f && d2 <= 0.0f) {
-		ptt = a;
-		float3 dist = f3_sub(pt, ptt);
-		return f3_dot(dist, dist); // barycentric coordinates (1,0,0)
+	int idx2 = threadIdx.x + blockDim.x * blockIdx.x;
+	if (idx2 >= iSampleSize2) {
+		return;
 	}
-	// Check if P in vertex region outside B
-	float3 bp = f3_sub(pt, b);
-	float d3 = f3_dot(ab, bp);
-	float d4 = f3_dot(ac, bp);
-	if (d3 >= 0.0f && d4 <= d3) {
-		ptt = b;
-		float3 dist = f3_sub(pt, ptt);
-		return f3_dot(dist, dist); // barycentric coordinates (0,1,0)
+	int hit2 = 0;
+	const BBox& box2 = iBBoxLeaf2[idx2];
+	const Triangle& triangle2 = iTriangle2[idx2];
+	if (iSampleSize == 1) {
+		int hit = 0;
+		const BBox& box = *iLeafNodes[0].GetBBox();
+		if (box2.Intersect(box)) {
+			//const Triangle& triangle = myMesh[0];
+			//if (triangle2.Intersect(triangle)) {
+				hit2 = 1;
+				hit = 1;
+			//}
+		}
+		oHit2[idx2] = hit2;
+		oHit[0] = hit;
+		return;
 	}
-	// Check if P in edge region of AB, if so return projection of P onto AB
-	float vc = d1 * d4 - d3 * d2;
-	if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
-		float v = d1 / (d1 - d3);
-		ptt = f3_add(a, f3_sclrmult(v, ab));
-		float3 dist = f3_sub(pt, ptt);
-		return f3_dot(dist, dist); // barycentric coordinates (1-v,v,0)
-	}
-	// Check if P in vertex region outside C
-	float3 cp = f3_sub(pt, c);
-	float d5 = f3_dot(ab, cp);
-	float d6 = f3_dot(ac, cp);
-	if (d6 >= 0.0f && d5 <= d6) {// barycentric coordinates (0,0,1)
-		ptt = c;
-		float3 dist = f3_sub(pt, ptt);
-		return f3_dot(dist, dist);
-	}
-	// Check if P in edge region of AC, if so return projection of P onto AC
-	float vb = d5 * d2 - d1 * d6;
-	if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
-		float w = d2 / (d2 - d6);
-		ptt = f3_add(a, f3_sclrmult(w, ac));
-		float3 dist = f3_sub(pt, ptt);
-		return f3_dot(dist, dist); // barycentric coordinates (1-w,0,w)
-	}
-	// Check if P in edge region of BC, if so return projection of P onto BC
-	float va = d3 * d6 - d5 * d4;
-	if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
-		float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-		ptt = f3_add(b, f3_sclrmult(w, f3_sub(c, b)));
-		float3 dist = f3_sub(pt, ptt);
-		return f3_dot(dist, dist); // barycentric coordinates (0,1-w,w)
-	}
-	// P inside face region. Compute Q through its barycentric coordinates (u,v,w)
-	float denom = 1.0f / (va + vb + vc);
-	float v = vb * denom;
-	float w = vc * denom;
-	// = u*a + v*b + w*c, u = va * denom = 1.0f - v - w
-	ptt = f3_add(a, f3_add(f3_sclrmult(v, ab), f3_sclrmult(w, ac)));
-	float3 dist = f3_sub(pt, ptt);
-	return f3_dot(dist, dist);
-}
 
-//, float3 &pr1, float3 &pr2) pr1,pr2 is nearest pair of points
-__device__ __host__ bool IntersectTriangleTriangle(
-	const float3 a1, const float3 b1, const float3 c1,
-	const float3 a2, const float3 b2, const float3 c2
-	const Triangle&)
-{
-	float3 pr1, pr2;
-	float local_min;
-	float temp;
-	float s = 0, t = 0;
-	float3 p1;
-	float3 p2;
-	local_min = edge_to_edge(a1, b1, a2, b2, s, t, p1, p2);
-	pr1 = p1;
-	pr2 = p2;
-	temp = edge_to_edge(a1, c1, a2, b2, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(c1, b1, a2, b2, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(a1, b1, a2, c2, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(a1, c1, a2, c2, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(c1, b1, a2, c2, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(a1, b1, c2, b2, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(a1, c1, c2, b2, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(c1, b1, c2, b2, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	p1 = a1;
-	temp = point_to_triangle(p1, p2, a2, b2, c2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	p1 = b1;
-	temp = point_to_triangle(p1, p2, a2, b2, c2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	p1 = c1;
-	temp = point_to_triangle(p1, p2, a2, b2, c2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	p2 = a2;
-	temp = point_to_triangle(p2, p1, a1, b1, c1);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	p2 = b2;
-	temp = point_to_triangle(p2, p1, a1, b1, c1);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	p2 = c2;
-	temp = point_to_triangle(p2, p1, a1, b1, c1);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	float3 dist = f3_sub(pr1, pr2);
-	return (f3_dot(dist, dist) < EPSILON);
-}
-
-__device__ bool intersect(const BBox& bbox2, const Triangle& tri2, int* outHit,
-	InternalNode* internalNodes, LeafNode* leafNodes, Triangle* myMesh) {
-	bool HIT = false;
 	int visit_stack[64] = { 0 };
-	int level_stack[64] = { 0 };
 	int stack_ptr = 1;
 	while (stack_ptr > 0) {
 		--stack_ptr;
 		int idx = visit_stack[stack_ptr];
-		int level = level_stack[stack_ptr];
-		BBox box = internalNodes[idx].getBBox();
-		bool bbox_hit = IntersectAABBAABB(bbox2, box);
-		if (!bbox_hit) {
-			// cout << "not hit at level " << level << endl;
+		const BBox& box = *iInternalNodes[idx].GetBBox();
+		if (!box2.Intersect(box)) {
 			continue;
 		} else {
-			// cout << "hit at level " << level << endl;
 		}
-		///
-		if (internalNodes[idx].rightNodeType() == LEAFNODE) {
-			// this is incorrect
-			// const float3& a = myMesh[internalNodes[idx].rightNodeIdx()].a;
-			// const float3& b = myMesh[internalNodes[idx].rightNodeIdx()].b;
-			// const float3& c = myMesh[internalNodes[idx].rightNodeIdx()].c;
-			// corrected
-			const Triangle& tri =
-				myMesh[leafNodes[internalNodes[idx].rightNodeIdx()].getObjectID()];
-#if 0 // debugging
-			BBox boxleft = leafNodes
-				[internalNodes[idx].rightNodeIdx()].getBBox();
-			if (boxleft.Contains(a) && boxleft.Contains(b) && boxleft.Contains(c)) {
-				cout << "contains" << endl;
+		//
+		int childIdxL = iInternalNodes[idx].ChildIdxL();
+		int childIdxR = iInternalNodes[idx].ChildIdxR();
+		//
+		if (iInternalNodes[idx].ChildTypeL() == LEAFNODE) {
+			const BBox& boxL = *iLeafNodes[childIdxL].GetBBox();
+			if (box2.Intersect(boxL)) {
+				int objID = iLeafNodes[childIdxL].GetObjID();
+				const Triangle& triangle = myMesh[objID];
+				if (triangle2.Intersect(triangle)) {
+					oHit[objID] = 1;
+					hit2 = 1;
+				}
 			}
-			else {
-				cout << "not contains" << endl;
-				cout << boxleft.toString();
-				cout << a.x << "," << a.y << "," << a.z << endl;
-				cout << b.x << "," << b.y << "," << b.z << endl;
-				cout << c.x << "," << c.y << "," << c.z << endl;
-				cout << level << endl;
-			}
-#endif
-			// cout << "ray: " << "(";
-			// cout << ray_orig.x << "," << ray_orig.y << "," << ray_orig.z;
-			// cout << ") " << "(";
-			// cout << ray_dir.x << "," << ray_dir.y << "," << ray_dir.z;
-			// cout << ")" << endl;
-			bool hit = tri2.Intersect(tri);
-			// cout << "testing right leaf: " << near_idx << ", " << hit << endl;
-			if (hit) {
-				outHit[internalNodes[idx].rightNodeIdx()] = 1;
-				HIT = true;
-			}
-		}
-		else {
-			visit_stack[stack_ptr] = internalNodes[idx].rightNodeIdx();
-			level_stack[stack_ptr] = level + 1;
+		} else {
+			visit_stack[stack_ptr] = childIdxL;
 			++stack_ptr;
 		}
-		///
-		if (internalNodes[idx].leftNodeType() == LEAFNODE) {
-			// this is incorrect
-			// const float3& a = myMesh[internalNodes[idx].leftNodeIdx()].a;
-			// const float3& b = myMesh[internalNodes[idx].leftNodeIdx()].b;
-			// const float3& c = myMesh[internalNodes[idx].leftNodeIdx()].c;
-			// corrected
-			const Triangle& tri =
-				myMesh[leafNodes[internalNodes[idx].leftNodeIdx()].getObjectID()];
-#if 0 // debugging
-			BBox boxleft = leafNodes
-				[internalNodes[idx].leftNodeIdx()].getBBox();
-			if (boxleft.Contains(a) && boxleft.Contains(b) && boxleft.Contains(c)) {
-				cout << "contains" << endl;
+		if (iInternalNodes[idx].ChildTypeR() == LEAFNODE) {
+			const BBox& boxR = *iLeafNodes[childIdxR].GetBBox();
+			if (box2.Intersect(boxR)) {
+				int objID = iLeafNodes[childIdxR].GetObjID();
+				const Triangle& triangle = myMesh[objID];
+				if (triangle2.Intersect(triangle)) {
+					oHit[objID] = 1;
+					hit2 = 1;
+				}
 			}
-			else {
-				cout << "not contains" << endl;
-				cout << boxleft.toString();
-				cout << a.x << "," << a.y << "," << a.z << endl;
-				cout << b.x << "," << b.y << "," << b.z << endl;
-				cout << c.x << "," << c.y << "," << c.z << endl;
-				cout << level << endl;
-			}
-#endif
-			// cout << "ray: " << "(";
-			// cout << ray_orig.x << "," << ray_orig.y << "," << ray_orig.z;
-			// cout << ") " << "(";
-			// cout << ray_dir.x << "," << ray_dir.y << "," << ray_dir.z;
-			// cout << ")" << endl;
-			bool hit = tri2.Intersect(tri);
-			// cout << "testing left leaf: " << near_idx << ", " << hit << endl;
-			if (hit) {
-				outHit[internalNodes[idx].leftNodeIdx()] = 1;
-				HIT = true;
-			}
-		}
-		else {
-			visit_stack[stack_ptr] = internalNodes[idx].leftNodeIdx();
-			level_stack[stack_ptr] = level + 1;
+		} else {
+			visit_stack[stack_ptr] = childIdxR;
 			++stack_ptr;
 		}
 	}
-	return HIT; // ray epsilon to mitigate self intersection
+	oHit2[idx2] = hit2;
+
+
+#ifdef DEBUG
+	if (idx2 < 50) {
+		CUDA_DEBUG_PRINT("idx2=%d, oHit2[%d]=%d, oHit[%d]=%d\n",
+			idx2, idx2, oHit2[idx2], idx2, oHit[idx2]);
+	}
+#endif
 }
 
-__global__ void intersectKernel(int total_boxes2,
-	BBox* bboxes2, Triangle* tris2, int* outHit, int* outHit2,
-	InternalNode* internalNodes, LeafNode* leafNodes, Triangle* myMesh)
-{
-	int idx = threadIdx.x + blockDim.x * blockIdx.x;
-	if (idx >= total_boxes2)
-		return;
-	if (intersect(bboxes2[idx], tris2[idx], outHit,
-		internalNodes, leafNodes, myMesh))
-	{
-		outHit2[idx] = 1;
-	}
-	else {
-		outHit2[idx] = 0;
-	}
-}
-
-void CudaBVH::generateValues(int* keys) {
+void CudaBVH::generateValues(int* iKeys) {
 	int* d_keys;
-	int size = SAMPLE_SIZE * sizeof(HashType);
+	int size = _SampleSize * sizeof(HashType);
 	checkCudaErrors(cudaMalloc((void**)&d_keys, size));
-	valuesKernel << <(SAMPLE_SIZE + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
-		THREADS_PER_BLOCK >> > (SAMPLE_SIZE, d_keys);
+	ValuesKernel<<<(_SampleSize+_ThreadsPerBlock-1)/_ThreadsPerBlock, _ThreadsPerBlock>>>(_SampleSize, d_keys);
 	getLastCudaError("value err");
-	checkCudaErrors(cudaMemcpy(keys, d_keys, size, cudaMemcpyDeviceToHost));
+	checkCudaErrors(cudaMemcpy(iKeys, d_keys, size, cudaMemcpyDeviceToHost));
 	checkCudaErrors(cudaFree(d_keys));
 }
 
-BVHTree CudaBVH::generateBVHTree(int* values,//element index in the unsorted array
-	BBox* objects, Triangle* tris) {
-	//for (int n = 0 ; n < SAMPLE_SIZE; n++) {
-	//    BBox b = objects[n];
-	//    Triangle t = tris[n];
-	//    if (b.Contains(t.a) && b.Contains(t.b) && b.Contains(t.c)) {
-	//        cout << "contains" << endl;
-	//    }
-	//    else{
-	//        cout << "not contains" << endl;
+void CudaBVH::boxIntersect(int iSampleSize2, BBox* iBBoxLeaf2, Triangle* iTriangle2, int* oHit2, int* oHit) {
+	cudaMemset((void*)oHit, 0, _SampleSize * sizeof(int));
+	cudaMemset((void*)oHit2, 0, iSampleSize2 * sizeof(int));
 
-	//        cout << b.toString();
-	//        cout << t.a.x << "," << t.a.y << "," << t.a.z << endl;
-	//        cout << t.b.x << "," << t.b.y << "," << t.b.z << endl;
-	//        cout << t.c.x << "," << t.c.y << "," << t.c.z << endl;
-	//    }
-	//}
-
-	////the unsorted element index
-	//for (int n = 0; n < SAMPLE_SIZE; n++) {
-	//    cout << values[n] << endl;
-	//}
-
-	myMesh.resize(SAMPLE_SIZE);
-	for (int n = 0; n < SAMPLE_SIZE; n++) {
-		myMesh[n] = tris[n];
-	}
-	myBBox.resize(SAMPLE_SIZE);
-	for (int n = 0; n < SAMPLE_SIZE; n++) {
-		myBBox[n] = objects[n];
-	}
-	checkCudaErrors(cudaMalloc((void**)&d_myMesh, SAMPLE_SIZE * sizeof(Triangle)));
-	checkCudaErrors(cudaMemcpy(d_myMesh, &myMesh[0],
-		SAMPLE_SIZE * sizeof(Triangle), cudaMemcpyHostToDevice));
-	checkCudaErrors(cudaMalloc((void**)&d_myBBox, SAMPLE_SIZE * sizeof(BBox)));
-	checkCudaErrors(cudaMemcpy(d_myBBox, &myBBox[0],
-		SAMPLE_SIZE * sizeof(BBox), cudaMemcpyHostToDevice));
-	HashType* d_objKeys;
-	int* d_objValues;
-	BBox* d_objects;
-	cudaMalloc((void**)&d_objValues, SAMPLE_SIZE * sizeof(int));
-	cudaMalloc((void**)&d_objKeys, SAMPLE_SIZE * sizeof(HashType));
-	cudaMalloc((void**)&d_objects, SAMPLE_SIZE * sizeof(BBox));
-	cudaMemcpy(d_objects, objects, SAMPLE_SIZE * sizeof(BBox),
-		cudaMemcpyHostToDevice);
-	cudaMemcpy(d_objValues, values, SAMPLE_SIZE * sizeof(int),
-		cudaMemcpyHostToDevice);
+	// Compute intersection
 	cudaEvent_t start, stop;
 	cudaEventCreate(&start);
 	cudaEventCreate(&stop);
-	cudaMallocManaged((void**)&mor, SAMPLE_SIZE * sizeof(MortonRec));
-	cudaDeviceSynchronize();
 	cudaEventRecord(start);
-	morton3DCuda << <(SAMPLE_SIZE+THREADS_PER_BLOCK-1)/THREADS_PER_BLOCK,
-		THREADS_PER_BLOCK >> > (SAMPLE_SIZE, d_objKeys, d_objects, mor);
+	intersectKernel<<<(iSampleSize2 +_ThreadsPerBlock-1)/_ThreadsPerBlock, _ThreadsPerBlock>>>(
+		iSampleSize2, iBBoxLeaf2, iTriangle2, oHit2, oHit, _SampleSize, d_internalNodes, d_leafNodes, d_mesh);
 	cudaEventRecord(stop);
-	cudaDeviceSynchronize();
-	/*{
-		HashType *keys = new HashType[SAMPLE_SIZE];
-		BBox *boxes = new BBox[SAMPLE_SIZE];
-		checkCudaErrors(cudaMemcpy(keys, d_objKeys, sizeof(HashType)*SAMPLE_SIZE,
-			cudaMemcpyDeviceToHost));
-		checkCudaErrors(cudaMemcpy(boxes, d_objects, sizeof(BBox) * SAMPLE_SIZE,
-			cudaMemcpyDeviceToHost));
-		for (int n = 0; n < SAMPLE_SIZE; n++) {
-			cout << "key " << n << " = " << keys[n] << endl;
-		}
-
-		for (;;);
-	}*/
 	cudaEventSynchronize(stop);
 	float milliseconds = 0;
 	cudaEventElapsedTime(&milliseconds, start, stop);
 	cudaEventDestroy(start);
 	cudaEventDestroy(stop);
-	printf("It took me %f milliseconds to generate morton codes.\n", milliseconds);
-	/*for (int i = 0; i < SAMPLE_SIZE; i++)
-	printf("%d\n", d_keys[i]);*/
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
-
-	// Radix sort
-	int num_items = SAMPLE_SIZE;
-	int size = SAMPLE_SIZE * sizeof(HashType);
-	DoubleBuffer<HashType> d_sortedKeys;
-	DoubleBuffer<int> d_sortedValues;
-	CubDebugExit(g_allocator.DeviceAllocate(
-		(void**)&d_sortedKeys.d_buffers[0], sizeof(HashType) * num_items));
-	CubDebugExit(g_allocator.DeviceAllocate(
-		(void**)&d_sortedKeys.d_buffers[1], sizeof(HashType) * num_items));
-	CubDebugExit(g_allocator.DeviceAllocate(
-		(void**)&d_sortedValues.d_buffers[0], sizeof(int) * num_items));
-	CubDebugExit(g_allocator.DeviceAllocate(
-		(void**)&d_sortedValues.d_buffers[1], sizeof(int) * num_items));
-
-	// Allocate temporary storage
-	size_t  temp_storage_bytes = 0;
-	void* d_temp_storage = NULL;
-	cudaEventRecord(start);
-	CubDebugExit(DeviceRadixSort::SortPairs(d_temp_storage,
-		temp_storage_bytes, d_sortedKeys, d_sortedValues, num_items));
-	CubDebugExit(g_allocator.DeviceAllocate(&d_temp_storage, temp_storage_bytes));
-	CubDebugExit(cudaMemcpy(d_sortedKeys.d_buffers[d_sortedKeys.selector],
-		d_objKeys, sizeof(HashType) * num_items, cudaMemcpyDeviceToDevice));
-	CubDebugExit(cudaMemcpy(d_sortedValues.d_buffers[d_sortedValues.selector],
-		d_objValues, sizeof(int) * num_items, cudaMemcpyDeviceToDevice));
-	CubDebugExit(DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes,
-		d_sortedKeys, d_sortedValues, num_items));
-	cudaEventRecord(stop);
-	checkCudaErrors(cudaMemcpy(d_objValues, d_sortedValues.Current(),
-		SAMPLE_SIZE * sizeof(int), cudaMemcpyDeviceToDevice));
-	checkCudaErrors(cudaMemcpy(d_objKeys, d_sortedKeys.Current(),
-		SAMPLE_SIZE * sizeof(HashType), cudaMemcpyDeviceToDevice));
-	//{
-	//	HashType* keys = new HashType[SAMPLE_SIZE];
-	//	int* values = new int[SAMPLE_SIZE];
-	//	checkCudaErrors(cudaMemcpy(keys, d_objKeys,
-	//		sizeof(HashType) * SAMPLE_SIZE, cudaMemcpyDeviceToHost));
-	//	checkCudaErrors(cudaMemcpy(values, d_objValues,
-	//		sizeof(int) * SAMPLE_SIZE, cudaMemcpyDeviceToHost));
-	//	for (int n = 0; n < SAMPLE_SIZE; n++) {
-	//		cout << "key, value " << n << " = ";
-	//		cout << keys[n] << ", " << values[n] << endl;
-	//	}
-	//	for (;;);
-	//}
-	//(FALSE)also apply the sorted order to the triangle array
-	//{
-	//	// the sorted element index
-	//	cudaMemcpy(values, d_objValues, SAMPLE_SIZE * sizeof(int),
-	//		cudaMemcpyDeviceToHost);
-	//	//for (int n = 0; n < SAMPLE_SIZE; n++) {
-	//	//    cout << values[n] << endl;
-	//	//}
-
-	//	vector<Triangle> oldMesh = myMesh;
-	//	for (int n = 0; n < SAMPLE_SIZE; n++) {
-	//		myMesh[n] = oldMesh[values[n]];
-	//	}
-	//}
-	cudaEventSynchronize(stop);
-	milliseconds = 0;
-	cudaEventElapsedTime(&milliseconds, start, stop);
-	cudaEventDestroy(start);
-	cudaEventDestroy(stop);
-	printf("It took me %f milliseconds to run parallel radix sort.\n", milliseconds);
-	///debug
-	/*int* vbuf = new int[SAMPLE_SIZE];
-	HashType* kbuf = new HashType[SAMPLE_SIZE];
-	cudaMemcpy(vbuf, d_objValues, SAMPLE_SIZE*sizeof(int), cudaMemcpyDeviceToHost);
-	cudaMemcpy(kbuf, d_objKeys, SAMPLE_SIZE*sizeof(HashType), cudaMemcpyDeviceToHost);
-	for (int i = 0; i < SAMPLE_SIZE; i++)
-	cout << "Sorted value: " << vbuf[i] << " key: " << bitset<64>(kbuf[i]) << "\n";
-	*/
-	/////Generate hierachy
-	LeafNode* d_leafNodes;
-	InternalNode* d_internalNodes;
-	// Construct leaf nodes.
-	// Note: This step can be avoided by storing
-	// the tree in a slightly different way.
-	cudaMalloc((void**)&d_leafNodes, SAMPLE_SIZE * sizeof(LeafNode));
-	cudaMallocManaged(
-		(void**)&d_internalNodes, (SAMPLE_SIZE - 1) * sizeof(InternalNode));
-	for (int n = 0; n < SAMPLE_SIZE; n++) {
-		d_internalNodes[n] = InternalNode();
-	}
-	checkCudaErrors(cudaDeviceSynchronize());
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
-	cudaEventRecord(start);
-	assignLeafNodes << <(SAMPLE_SIZE+THREADS_PER_BLOCK-1)/THREADS_PER_BLOCK,
-		THREADS_PER_BLOCK >> > (SAMPLE_SIZE, d_leafNodes, d_objValues, d_objects);
-	//{
-	//	// the sorted element index
-	//	cudaMemcpy(values, d_objValues, SAMPLE_SIZE * sizeof(int),
-	//		cudaMemcpyDeviceToHost);
-	//	cudaMemcpy(objects, d_objects, SAMPLE_SIZE * sizeof(int),
-	//		cudaMemcpyDeviceToHost);
-	//	//             for (int n = 0; n < SAMPLE_SIZE; n++) {
-	//	//                 cout << values[n] << endl;
-	//	//             }
-
-	//	for (int n = 0; n < SAMPLE_SIZE; n++) {
-	//		BBox b = objects[values[n]];
-	//		Triangle t = myMesh[values[n]];
-	//		if (b.Contains(t.a) && b.Contains(t.b) && b.Contains(t.c)) {
-	//			//                     cout << "contains" << endl;
-	//		}
-	//		else {
-	//			cout << "not contains" << endl;
-
-	//			cout << b.toString();
-	//			cout << t.a.x << "," << t.a.y << "," << t.a.z << endl;
-	//			cout << t.b.x << "," << t.b.y << "," << t.b.z << endl;
-	//			cout << t.c.x << "," << t.c.y << "," << t.c.z << endl;
-	//		}
-	//	}
-	//	for (;;);
-	//}
-	assignInternalNodes 
-		<<<(SAMPLE_SIZE+THREADS_PER_BLOCK-2)/THREADS_PER_BLOCK,
-		THREADS_PER_BLOCK >>>
-		(SAMPLE_SIZE, d_objKeys, d_leafNodes, d_internalNodes, d_objValues);
-	cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
-	milliseconds = 0;
-	cudaEventElapsedTime(&milliseconds, start, stop);
-	cudaEventDestroy(start);
-	cudaEventDestroy(stop);
-	printf("It took me %f milliseconds to generate hierachy.\n", milliseconds);
-	cudaFree(d_objKeys); cudaFree(d_objValues); cudaFree(d_objects);
-	/*LeafNode* leafNodes = new LeafNode[SAMPLE_SIZE];
-	InternalNode* internalNodes = new InternalNode[SAMPLE_SIZE - 1];
-	cudaMemcpy(leafNodes, d_leafNodes, SAMPLE_SIZE*sizeof(LeafNode),
-		cudaMemcpyDeviceToHost);
-	cudaMemcpy(internalNodes, d_internalNodes,
-		(SAMPLE_SIZE-1)*sizeof(InternalNode), cudaMemcpyDeviceToHost);
-	for (int i = 0; i < SAMPLE_SIZE; ++i)
-	cout << internalNodes[i].getIdx() << " " << internalNodes[i].getParent() << "\n";*/
-	/////Assign bounding box to internal nodes
-	int* atom;
-	cudaMalloc((void**)&atom, SAMPLE_SIZE * sizeof(int));
-	cudaMemset(atom, 0, SAMPLE_SIZE * sizeof(int));
-	cudaEventCreate(&start);
-	cudaEventCreate(&stop);
-	cudaEventRecord(start);
-	internalNodeBBox << <(SAMPLE_SIZE + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK,
-		THREADS_PER_BLOCK >> >
-		(SAMPLE_SIZE, atom, d_internalNodes, d_leafNodes, d_myBBox);
-	cudaEventRecord(stop);
-	cudaEventSynchronize(stop);
-	milliseconds = 0;
-	cudaEventElapsedTime(&milliseconds, start, stop);
-	cudaEventDestroy(start);
-	cudaEventDestroy(stop);
-	printf("It took me %f milliseconds to assign bounding box.\n", milliseconds);
-	LeafNode* leafNodes = new LeafNode[SAMPLE_SIZE];
-	InternalNode* internalNodes = new InternalNode[SAMPLE_SIZE - 1];
-	cudaMemcpy(leafNodes, d_leafNodes,
-		SAMPLE_SIZE * sizeof(LeafNode), cudaMemcpyDeviceToHost);
-	cudaMemcpy(internalNodes, d_internalNodes,
-		(SAMPLE_SIZE - 1) * sizeof(InternalNode), cudaMemcpyDeviceToHost);
-	BVHTree buf;
-	buf.internalNodes = internalNodes;
-	buf.leafNodes = leafNodes;
-	myTree = buf;
-	BVHTree d_buf;
-	d_buf.internalNodes = d_internalNodes;
-	d_buf.leafNodes = d_leafNodes;
-	d_myTree = d_buf;
-	//printBVH(internalNodes, leafNodes);
-	//cudaFree(d_internalNodes); cudaFree(d_leafNodes);
+	CUDA_DEBUG_PRINT("It took me %f milliseconds to compute intersection.\n", milliseconds);
 }
 
-CudaBVH::~CudaBVH() {
-	checkCudaErrors(cudaFree(d_myTree.internalNodes));
-	checkCudaErrors(cudaFree(d_myTree.leafNodes));
-	checkCudaErrors(cudaFree(d_myMesh));
-	checkCudaErrors(cudaFree(d_myBBox));
-	cudaFree(mor);
-}
 
-// 	CudaBVH::CudaBVH() {
-// 		SAMPLE_SIZE = 10;
-// 		THREADS_PER_BLOCK = 5;
-// 		BBox* dummy = new BBox[SAMPLE_SIZE];
-// 		generateSampleDataset(dummy);
-// 		CudaBVH(dummy, SAMPLE_SIZE, THREADS_PER_BLOCK);
-// 		free(dummy);
-// 	}
-
-// 	CudaBVH(int sample_size, int threads_per_block) {
-// 		SAMPLE_SIZE = sample_size;
-// 		THREADS_PER_BLOCK = threads_per_block;
-// 		BBox* dummy = new BBox[SAMPLE_SIZE];
-// 		generateSampleDataset(dummy);
-// 		Init(dummy, SAMPLE_SIZE, THREADS_PER_BLOCK);
-//         delete[] dummy;
-// 	}
-
-CudaBVH::CudaBVH(BBox* objects, Triangle* tris, int sample_size,
-	int threads_per_block)
-{
-	SAMPLE_SIZE = sample_size;
-	THREADS_PER_BLOCK = threads_per_block;
-	Init(objects, tris, SAMPLE_SIZE, THREADS_PER_BLOCK);
-}
-
-void CudaBVH::Init(BBox* objects, Triangle* tris, int sample_size,
-	int threads_per_block)
-{
-	SAMPLE_SIZE = sample_size;
-	THREADS_PER_BLOCK = threads_per_block;
-	cout << SAMPLE_SIZE << " " << THREADS_PER_BLOCK << endl;
-	int* values;
-	values = new int[SAMPLE_SIZE];
-	// 		generateValues(values);
-	//         for (int n = 0; n < SAMPLE_SIZE; n++) {
-	//             cout << "dfhgsd" << values[n] << endl;
-	//         }
-	for (int n = 0; n < SAMPLE_SIZE; n++) {
-		values[n] = n;
-	}
-	generateBVHTree(values, objects, tris);
-	delete[] values;
-}
-
-void CudaBVH::generateSampleDataset(BBox* objects) {
-	float buf[6];
-	for (int i = 0; i < SAMPLE_SIZE; i++) {
-		for (int j = 0; j < 6; j++)
-			buf[j] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX);
-		objects[i]._max.x = max(buf[0], buf[1]);
-		objects[i]._min.x = min(buf[0], buf[1]);
-		objects[i]._max.y = max(buf[2], buf[3]);
-		objects[i]._min.y = min(buf[2], buf[3]);
-		objects[i]._max.z = max(buf[4], buf[5]);
-		objects[i]._min.z = min(buf[4], buf[5]);
-	}
-}
-
-#if 0
-void CudaBVH::printBVH(int idx, int level) {
-	cout << "Internal (" << level << ") " << idx << " ";
-	cout << myTree.internalNodes[idx].getBBox().toString() << "\n";
-	if (myTree.internalNodes[idx].leftNodeType() == LEAFNODE) {
-		cout << "Leaf (l) " << myTree.leafNodes
-			[myTree.internalNodes[idx].leftNodeIdx()].getObjectID() << " "
-			<< myTree.leafNodes
-			[myTree.internalNodes[idx].leftNodeIdx()].getBBox().toString()
-			<< "\n";
-	} else
-		printBVH(myTree.internalNodes[idx].leftNodeIdx(), level + 1);
-
-	if (myTree.internalNodes[idx].rightNodeType() == LEAFNODE) {
-		cout << "Leaf (r) " << myTree.leafNodes
-			[myTree.internalNodes[idx].rightNodeIdx()].getObjectID() << " "
-			<< myTree.leafNodes
-			[myTree.internalNodes[idx].rightNodeIdx()].getBBox().toString()
-			<< "\n";
-	} else printBVH(myTree.internalNodes[idx].rightNodeIdx(), level + 1);
-}
-#else
-void CudaBVH::printBVH(InternalNode* internalNodes, LeafNode* leafNodes) {
-	int visit_stack[64] = { 0 };
-	int level_stack[64] = { 0 };
-	int stack_ptr = 1;
-	while (stack_ptr > 0) {
-		--stack_ptr;
-		int idx = visit_stack[stack_ptr];
-		int level = level_stack[stack_ptr];
-		//int pid = myTree.internalNodes[idx].getParent();
-		//cout << idx << ", " << level << ", " << stack_ptr << endl;
-		//if (pid == -1) {
-		//	cout << "Internal (" << level << ") " << idx << " "
-		//		<< myTree.internalNodes[idx].getBBox().toString() << endl;
-		//}
-		if (level > 100 /*idx > 38000*/) {
-			cout << "===============================" << endl;
-			cout << "node info {" << endl;
-			cout << "  level: " << level << endl;
-			cout << "  node idx: " << idx << ", "
-				<< myTree.internalNodes[idx].getIdx() << endl;
-			cout << "  node type: "
-				<< myTree.internalNodes[idx].getType() << endl;
-			cout << "  node.parent idx: "
-				<< myTree.internalNodes[idx].getParent() << endl;
-			cout << "  ndoe.parent type: "
-				<< myTree.internalNodes[idx].parentType() << endl;
-			cout << "  node.left idx: "
-				<< myTree.internalNodes[idx].leftNodeIdx() << endl;
-			cout << "  node.left type: "
-				<< myTree.internalNodes[idx].leftNodeType() << endl;
-			cout << "  node.right idx: "
-				<< myTree.internalNodes[idx].rightNodeIdx() << endl;
-			cout << "  node.right type: "
-				<< myTree.internalNodes[idx].rightNodeType() << endl;
-			cout << "}" << endl;
-		}
-		if (myTree.internalNodes[idx].rightNodeType() == LEAFNODE) {
-			//if (myTree.leafNodes
-			//	[myTree.internalNodes[idx].rightNodeIdx()].getParent() == -1)
-			//{
-			//	cout << "Leaf (r) " << myTree.leafNodes
-			//		[myTree.internalNodes[idx].rightNodeIdx()].getObjectID()
-			//		<< " " << myTree.leafNodes
-			//		[myTree.internalNodes[idx].rightNodeIdx()].getBBox().toString()
-			//		<< endl;
-			//}
-		} else {
-			visit_stack[stack_ptr] = myTree.internalNodes[idx].rightNodeIdx();
-			level_stack[stack_ptr] = level + 1;
-			stack_ptr++;
-		}
-		if (myTree.internalNodes[idx].leftNodeType() == LEAFNODE) {
-			//if (myTree.leafNodes
-			//	[myTree.internalNodes[idx].leftNodeIdx()].getParent() == -1)
-			//{
-			//	cout << "Leaf (l) " << myTree.leafNodes
-			//		[myTree.internalNodes[idx].leftNodeIdx()].getObjectID()
-			//		<< " " << myTree.leafNodes
-			//		[myTree.internalNodes[idx].leftNodeIdx()].getBBox().toString()
-			//		<< endl;
-			//}
-		} else {
-			visit_stack[stack_ptr] = myTree.internalNodes[idx].leftNodeIdx();
-			level_stack[stack_ptr] = level + 1;
-			stack_ptr++;
-		}
-	}
-}
-#endif
-
-#if 0
-void CudaBVH::drawBVHRecursive(int idx, int level) {
-	if (level > 32) return;
-	float color[3] = { level * 0.03, 1 - level * 0.03, 0 };
-	myTree.internalNodes[idx].getBBox().Draw(color);
-	if (myTree.internalNodes[idx].leftNodeType() == LEAFNODE) {
-		myTree.leafNodes
-			[myTree.internalNodes[idx].leftNodeIdx()].getBBox().Draw(color);
-	} else
-		drawBVHRecursive(myTree.internalNodes[idx].leftNodeIdx(), level + 1);
-	if (myTree.internalNodes[idx].rightNodeType() == LEAFNODE) {
-		myTree.leafNodes
-			[myTree.internalNodes[idx].rightNodeIdx()].getBBox().Draw(color);
-	} else drawBVHRecursive(myTree.internalNodes[idx].rightNodeIdx(), level+1);
-}
-void CudaBVH::draw() {
-	glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-	drawBVHRecursive(0, 0);
-	glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-}
-#else
-void CudaBVH::draw(int levelDisplay) {
-	glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-	int visit_stack[64] = { 0 };
-	int level_stack[64] = { 0 };
-	int stack_ptr = 1;
-	while (stack_ptr > 0) {
-		--stack_ptr;
-		int idx = visit_stack[stack_ptr];
-		int level = level_stack[stack_ptr];
-		//if (level > 32) return;
-		float color[3] = { level * 0.03, 1 - level * 0.03, 0 };
-		if (level == levelDisplay)
-			myTree.internalNodes[idx].getBBox().Draw(color);
-		if (myTree.internalNodes[idx].rightNodeType() == LEAFNODE) {
-			//myTree.leafNodes
-			//[myTree.internalNodes[idx].rightNodeIdx()].getBBox().Draw(color);
-		}
-		else {
-			visit_stack[stack_ptr] = myTree.internalNodes[idx].rightNodeIdx();
-			level_stack[stack_ptr] = level + 1;
-			stack_ptr++;
-		}
-		if (myTree.internalNodes[idx].leftNodeType() == LEAFNODE) {
-			//myTree.leafNodes
-			//[myTree.internalNodes[idx].leftNodeIdx()].getBBox().Draw(color);
-		}
-		else {
-			visit_stack[stack_ptr] = myTree.internalNodes[idx].leftNodeIdx();
-			level_stack[stack_ptr] = level + 1;
-			stack_ptr++;
-		}
-	}
-	glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-}
-#endif
-
-void CudaBVH::drawTriangles() {
-	glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-	int visit_stack[64] = { 0 };
-	int level_stack[64] = { 0 };
-	int stack_ptr = 1;
-	while (stack_ptr > 0) {
-		--stack_ptr;
-		int idx = visit_stack[stack_ptr];
-		int level = level_stack[stack_ptr];
-		if (level > 32) return;
-		//float color[3] = { level * 0.03, 1 - level * 0.03, 0 };
-		if (myTree.internalNodes[idx].rightNodeType() == LEAFNODE) {
-			myMesh[myTree.internalNodes[idx].rightNodeIdx()].Draw();//color);
-		}
-		else {
-			visit_stack[stack_ptr] = myTree.internalNodes[idx].rightNodeIdx();
-			level_stack[stack_ptr] = level + 1;
-			stack_ptr++;
-		}
-		if (myTree.internalNodes[idx].leftNodeType() == LEAFNODE) {
-			myMesh[myTree.internalNodes[idx].leftNodeIdx()].Draw();// color);
-		}
-		else {
-			visit_stack[stack_ptr] = myTree.internalNodes[idx].leftNodeIdx();
-			level_stack[stack_ptr] = level + 1;
-			stack_ptr++;
-		}
-	}
-	glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-}
-
-void CudaBVH::drawTrianglesDEBUG() {
-	//         glDisable(GL_CULL_FACE);
-	glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-	int visit_stack[64] = { 0 };
-	int level_stack[64] = { 0 };
-	int stack_ptr = 1;
-	while (stack_ptr > 0) {
-		--stack_ptr;
-		int idx = visit_stack[stack_ptr];
-		int level = level_stack[stack_ptr];
-		if (level > 64) return;
-		//float color[3] = { level * 0.03, 1 - level * 0.03, 0 };
-		//myTree.internalNodes[idx].getBBox().Draw(color);
-		if (myTree.internalNodes[idx].rightNodeType() == LEAFNODE) {
-			// also works with large mesh
-			//myMesh[myTree.internalNodes[idx].rightNodeIdx()].draw(color);
-			//myMesh[myTree.internalNodes[idx].rightNodeIdx()].
-			//getBBox().Draw(color);
-			//myBBox[myTree.internalNodes[idx].rightNodeIdx()].Draw(color);
-			//myTree.leafNodes
-			//[myTree.internalNodes[idx].rightNodeIdx()].bbox_debug.Draw(color);//=
-			//myTree.leafNodes
-			//[myTree.internalNodes[idx].rightNodeIdx()].getBBox().Draw(color);//-
-			myMesh[myTree.leafNodes
-				[myTree.internalNodes[idx].rightNodeIdx()].
-				getObjectID()].Draw();// color);//- only works with small mesh
-		}
-		else {
-			visit_stack[stack_ptr] = myTree.internalNodes[idx].rightNodeIdx();
-			level_stack[stack_ptr] = level + 1;
-			stack_ptr++;
-		}
-		if (myTree.internalNodes[idx].leftNodeType() == LEAFNODE) {
-			// also works with large mesh
-			//myMesh[myTree.internalNodes[idx].leftNodeIdx()].Draw(color);
-			//myMesh[myTree.internalNodes[idx].leftNodeIdx()].
-			//getBBox().Draw(color);
-			//myBBox[myTree.internalNodes[idx].leftNodeIdx()].Draw(color);
-			//myTree.leafNodes[myTree.internalNodes[idx].leftNodeIdx()].
-			//bbox_debug.Draw(color);//=
-			//myTree.leafNodes[myTree.internalNodes[idx].leftNodeIdx()].
-			//getBBox().Draw(color);//-
-			myMesh[myTree.leafNodes[myTree.internalNodes[idx].leftNodeIdx()].
-				getObjectID()].Draw();// color);//- only works with small mesh
-		}
-		else {
-			visit_stack[stack_ptr] = myTree.internalNodes[idx].leftNodeIdx();
-			level_stack[stack_ptr] = level + 1;
-			stack_ptr++;
-		}
-	}
-	glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-}
-
-void CudaBVH::boxIntersect(int boxes2_count, BBox* bboxes2, Triangle* tris2,
-	int* outHit, int* outHit2)
-{
-	intersectKernel <<<(boxes2_count+THREADS_PER_BLOCK-1)/THREADS_PER_BLOCK,
-		THREADS_PER_BLOCK >>>
-		(boxes2_count, bboxes2, tris2, outHit, outHit2,
-			d_myTree.internalNodes, d_myTree.leafNodes, d_myMesh);
-	////for debugging
-	//for (int n = 0; n < ray_count; n++) {
-	//	outHit[n] = intersect
-	//		(ray_orig[n], ray_dir[n], outT[n], outU[n], outV[n], outIdx[n]);
-	//}
-}
 
 //bool CudaBVH::intersect(const float3& ray_orig, const float3& ray_dir,
 //	float& outT, float& outU, float& outV, int& outIdx)
@@ -1390,8 +722,8 @@ void CudaBVH::boxIntersect(int boxes2_count, BBox* bboxes2, Triangle* tris2,
 //	d_rayorig[0] = ray_orig;
 //	d_raydir[0] = ray_dir;
 //	checkCudaErrors(cudaDeviceSynchronize());
-//	intersectKernel << <1, 1 >> > (1, d_rayorig, d_raydir, d_t, d_u, d_v,
-//		d_idx, d_hit, d_myTree.internalNodes, d_myTree.leafNodes, d_myMesh);
+//	intersectKernel <<<1, 1 >>> (1, d_rayorig, d_raydir, d_t, d_u, d_v,
+//		d_idx, d_hit, d_myTree.internalNodes, d_myTree.leafNodes, d_mesh);
 //	checkCudaErrors(cudaDeviceSynchronize());
 //	outT = d_t[0];
 //	outU = d_u[0];
