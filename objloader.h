@@ -11,6 +11,7 @@ public:
 	ObjLoader(const std::string& iStr);
 
 	std::vector<Triangle> _tris;
+	BBox _box;
 };
 
 #endif

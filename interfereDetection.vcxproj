@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -42,11 +42,11 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>D:\Projects\glfw\include;D:\Projects\glm-1.0.2;D:\Program Files\glad\include;C:\ProgramData\NVIDIA Corporation\cuda-samples\Common;$(IncludePath)</IncludePath>
+    <IncludePath>D:\Projects\glfw\include;D:\Projects\glm-1.0.2;D:\Program Files\glad\include;C:\Program Files\NVIDIA Corporation\cuda-samples\Common;$(IncludePath)</IncludePath>
     <LibraryPath>D:\Projects\glfw\out\build\x64-Debug\src\Debug;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>D:\Projects\glfw\include;D:\Projects\glm-1.0.2;D:\Program Files\glad\include;$(VC_IncludePath);$(WindowsSDK_IncludePath);</IncludePath>
+    <IncludePath>D:\Projects\glfw\include;D:\Projects\glm-1.0.2;D:\Program Files\glad\include;C:\Program Files\NVIDIA Corporation\cuda-samples\Common;$(IncludePath)</IncludePath>
     <LibraryPath>D:\Projects\glfw\out\build\x64-Debug\src\Debug;$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -69,6 +69,7 @@
       <AdditionalOptions>-std=c++17 %(AdditionalOptions)</AdditionalOptions>
       <CodeGeneration>compute_61,sm_61</CodeGeneration>
       <GenerateRelocatableDeviceCode>false</GenerateRelocatableDeviceCode>
+      <GenerateLineInfo>true</GenerateLineInfo>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -92,16 +93,19 @@
       <AdditionalOptions>-std=c++17 %(AdditionalOptions)</AdditionalOptions>
       <CodeGeneration>compute_61,sm_61</CodeGeneration>
       <GenerateRelocatableDeviceCode>false</GenerateRelocatableDeviceCode>
+      <GPUDebugInfo>false</GPUDebugInfo>
+      <GenerateLineInfo>true</GenerateLineInfo>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="BBox.cuh" />
-    <ClInclude Include="BVHTree.cuh" />
     <ClInclude Include="CudaBVH.cuh" />
-    <ClInclude Include="freeglut.h" />
-    <ClInclude Include="freeglut_ext.h" />
-    <ClInclude Include="freeglut_std.h" />
-    <ClInclude Include="glut.h" />
+
+    <ClInclude Include="imgui\imgui.h" />
+    <ClInclude Include="imgui\imgui_internal.h" />
+    <ClInclude Include="imgui\imconfig.h" />
+    <ClInclude Include="imgui\imgui_impl_glfw.h" />
+    <ClInclude Include="imgui\imgui_impl_opengl3.h" />
     <ClInclude Include="InternalNode.cuh" />
     <ClInclude Include="LeafNode.cuh" />
     <ClInclude Include="Node.cuh" />
@@ -113,7 +117,6 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="bunny.STL" />
-    <None Include="freeglut.dll" />
     <None Include="helical gear_3_gb.STL" />
     <None Include="nut.stl" />
     <None Include="object1.stl" />
@@ -125,15 +128,20 @@
     <None Include="wrench.stl" />
   </ItemGroup>
   <ItemGroup>
-    <Library Include="freeglut.lib" />
   </ItemGroup>
   <ItemGroup>
-    <CudaCompile Include="BBox.cu" />
     <CudaCompile Include="CudaBVH.cu" />
     <CudaCompile Include="kernel.cu" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\..\Program Files\glad\src\glad.c" />
+    <ClCompile Include="imgui\imgui.cpp" />
+    <ClCompile Include="imgui\imgui_demo.cpp" />
+    <ClCompile Include="imgui\imgui_draw.cpp" />
+    <ClCompile Include="imgui\imgui_widgets.cpp" />
+    <ClCompile Include="imgui\imgui_tables.cpp" />
+    <ClCompile Include="imgui\imgui_impl_glfw.cpp" />
+    <ClCompile Include="imgui\imgui_impl_opengl3.cpp" />
     <ClCompile Include="objloader.cpp" />
     <ClCompile Include="Point.cu" />
     <ClCompile Include="Triangle.cu" />

@@ -15,353 +15,481 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-// settings
-const unsigned int SCR_WIDTH = 2250;
-const unsigned int SCR_HEIGHT = 1000;
+#include "imgui/imgui.h"
+#include "imgui/imgui_impl_glfw.h"
+#include "imgui/imgui_impl_opengl3.h"
 
-// camera
-glm::vec3 cameraPos = glm::vec3(0.0f, 0.0f, 3.0f);
-glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
-glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+class Application {
+private:
+    // settings
+    unsigned int _scrWidth = 2250;
+    unsigned int _scrHeight = 1000;
 
-bool firstMouse = true;
-float yaw = -90.0f;	// yaw is initialized to -90.0 degrees since a yaw of 0.0 results in a direction vector pointing to the right so we initially rotate a bit to the left.
-float pitch = 0.0f;
-float lastX = 800.0f / 2.0;
-float lastY = 600.0 / 2.0;
-float fov = 45.0f;
+    // camera
+    glm::vec3 _cameraPos = glm::vec3(4.618802f, 4.0f, 24.0f);
+    glm::vec3 _cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
+    glm::vec3 _cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
 
-// timing
-float deltaTime = 0.0f;	// time between current frame and last frame
-float lastFrame = 0.0f;
+    bool _firstMouse = true;
+    float _yaw = -90.0f;	// yaw is initialized to -90.0 degrees since a yaw of 0.0 results in a direction vector pointing to the right so we initially rotate a bit to the left.
+    float _pitch = 0.0f;
+    float _lastX = 800.0f / 2.0;
+    float _lastY = 600.0 / 2.0;
+    float _fov = 45.0f;
 
-void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
-    glViewport(0, 0, width, height);
-}
+    // timing
+    float _deltaTime = 0.0f;	// time between current frame and last frame
+    float _lastFrame = 0.0f;
 
-// process all input: query GLFW whether relevant keys are pressed/released this frame and react accordingly
-// ---------------------------------------------------------------------------------------------------------
-void processInput(GLFWwindow* window) {
-    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, true);
+    // Model matrix parameters for object 2 (wrench) - adjustable via ImGui
+    struct ModelParams {
+        float translateX = 4.618802f;
+        float translateY = 4.0f;
+        float translateZ = 0.0f;
+        float rotateAngle = -1.84f;
+        float rotateX = 0.0f;
+        float rotateY = 0.0f;
+        float rotateZ = 1.0f;
+        float scale = 1.75f;
+    } _modelParams;
 
-    float cameraSpeed = static_cast<float>(2.5 * deltaTime);
-    if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
-        cameraPos += cameraSpeed * cameraFront;
-    if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
-        cameraPos -= cameraSpeed * cameraFront;
-    if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
-        cameraPos -= glm::normalize(glm::cross(cameraFront, cameraUp)) * cameraSpeed;
-    if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
-        cameraPos += glm::normalize(glm::cross(cameraFront, cameraUp)) * cameraSpeed;
-}
+    // Resources for rendering
+    GLFWwindow* _window = nullptr;
+    Shader* _ourShader = nullptr;
+    unsigned int _texture[2];
+    float _colorObj[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+    float _colorBox[4] = { 0.0f, 0.0f, 1.0f, 0.2f };
+    float _colorHit[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
-void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
-    if (firstMouse) {
-        lastX = xpos;
-        lastY = ypos;
-        firstMouse = false;
+    ObjLoader* _obj[2] = { nullptr, nullptr };
+    int _triNum[2];
+    GLuint _VBO[2], _VBOBox[2], _VAO[2], _VAOBox[2], _TBO[2], _TEX[2];
+    cudaGraphicsResource_t _cudaRsc[2], _cudaRscBox[2], _cudaRscHit[2];
+    int _maxThreadsPerBlock = 0;
+
+    bool _mouseCaptured = true;
+
+    // Static callback wrappers that get Application instance from user pointer
+    static void framebuffer_size_callback_wrapper(GLFWwindow* window, int width, int height) {
+        Application* app = static_cast<Application*>(glfwGetWindowUserPointer(window));
+        app->framebufferSizeCallback(window, width, height);
     }
 
-    float xoffset = xpos - lastX;
-    float yoffset = lastY - ypos;
-    lastX = xpos;
-    lastY = ypos;
+    static void mouse_callback_wrapper(GLFWwindow* window, double xpos, double ypos) {
+        Application* app = static_cast<Application*>(glfwGetWindowUserPointer(window));
+        app->mouseCallback(window, xpos, ypos);
+    }
 
-    float sensitivity = 0.1f;
-    xoffset *= sensitivity;
-    yoffset *= sensitivity;
+    static void scroll_callback_wrapper(GLFWwindow* window, double xoffset, double yoffset) {
+        Application* app = static_cast<Application*>(glfwGetWindowUserPointer(window));
+        app->scrollCallback(window, xoffset, yoffset);
+    }
 
-    yaw += xoffset;
-    pitch += yoffset;
+    static void window_refresh_callback_wrapper(GLFWwindow* window) {
+        Application* app = static_cast<Application*>(glfwGetWindowUserPointer(window));
+        app->windowRefreshCallback(window);
+    }
 
-    if (pitch > 89.0f)
-        pitch = 89.0f;
-    if (pitch < -89.0f)
-        pitch = -89.0f;
+    // Callback implementations
+    void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
+        _scrWidth = width;
+        _scrHeight = height;
+        glViewport(0, 0, width, height);
+    }
 
-    glm::vec3 direction;
-    direction.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
-    direction.y = sin(glm::radians(pitch));
-    direction.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
-    cameraFront = glm::normalize(direction);
-}
+    void mouseCallback(GLFWwindow* window, double xpos, double ypos) {
+        // Only process mouse movement when captured (not interacting with UI)
+        if (!_mouseCaptured) {
+            return;
+        }
+        
+        if (_firstMouse) {
+            _lastX = xpos;
+            _lastY = ypos;
+            _firstMouse = false;
+        }
 
-// glfw: whenever the mouse scroll wheel scrolls, this callback is called
-// ----------------------------------------------------------------------
-void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
-    fov -= (float)yoffset;
-    if (fov < 1.0f)
-        fov = 1.0f;
-    if (fov > 45.0f)
-        fov = 45.0f;
-}
+        float xoffset = xpos - _lastX;
+        float yoffset = _lastY - ypos;
+        _lastX = xpos;
+        _lastY = ypos;
 
-void initVBOfloat3(GLuint& iVAO, GLuint& iVBO, int iNbVertex, cudaGraphicsResource_t& oCudaRsc) {
-    glGenVertexArrays(1, &iVAO);
-    glGenBuffers(1, &iVBO);
+        float sensitivity = 0.1f;
+        xoffset *= sensitivity;
+        yoffset *= sensitivity;
 
-    glBindVertexArray(iVAO);
+        _yaw += xoffset;
+        _pitch += yoffset;
 
-    glBindBuffer(GL_ARRAY_BUFFER, iVBO);
-    glBufferData(GL_ARRAY_BUFFER, iNbVertex*3*sizeof(float), nullptr, GL_DYNAMIC_DRAW);
-    
-    cudaError_t cudaStatus = cudaGraphicsGLRegisterBuffer(
-        &oCudaRsc, iVBO, cudaGraphicsRegisterFlagsWriteDiscard);
-    assert(cudaStatus == cudaSuccess);
+        if (_pitch > 89.0f)
+            _pitch = 89.0f;
+        if (_pitch < -89.0f)
+            _pitch = -89.0f;
 
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3*sizeof(float), (void*)0);
-    glEnableVertexAttribArray(0);
+        glm::vec3 direction;
+        direction.x = cos(glm::radians(_yaw)) * cos(glm::radians(_pitch));
+        direction.y = sin(glm::radians(_pitch));
+        direction.z = sin(glm::radians(_yaw)) * cos(glm::radians(_pitch));
+        _cameraFront = glm::normalize(direction);
+    }
 
-    glBindVertexArray(0);
-}
+    void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
+        _fov -= (float)yoffset;
+        if (_fov < 1.0f)
+            _fov = 1.0f;
+        if (_fov > 45.0f)
+            _fov = 45.0f;
+    }
 
-void initTBO(GLuint& iTBO, GLuint& iTEX, int iNbTriangle, cudaGraphicsResource_t& oCudaRsc) {
-    glGenBuffers(1, &iTBO);
-    glBindBuffer(GL_TEXTURE_BUFFER, iTBO);
-    glBufferData(GL_TEXTURE_BUFFER, iNbTriangle*sizeof(int), nullptr, GL_DYNAMIC_DRAW);
+    void windowRefreshCallback(GLFWwindow* window) {
+        render();
+        glfwSwapBuffers(window);
+    }
 
-    glGenTextures(1, &iTEX);
-    glBindTexture(GL_TEXTURE_BUFFER, iTEX);
-    glTexBuffer(GL_TEXTURE_BUFFER, GL_R32I, iTBO);
+    void initVBOfloat3(GLuint& iVAO, GLuint& iVBO, int iNbVertex, cudaGraphicsResource_t& oCudaRsc) {
+        glGenVertexArrays(1, &iVAO);
+        glGenBuffers(1, &iVBO);
 
-    cudaError_t cudaStatus = cudaGraphicsGLRegisterBuffer(
-        &oCudaRsc, iTBO, cudaGraphicsRegisterFlagsWriteDiscard);
-    assert(cudaStatus == cudaSuccess);
-}
+        glBindVertexArray(iVAO);
 
-// 清理VBO资源
-void cleanupVBO(GLuint& iVBO, cudaGraphicsResource_t& iCUDAresource) {
-    cudaGraphicsUnregisterResource(iCUDAresource);
-    glDeleteBuffers(1, &iVBO);
-}
+        glBindBuffer(GL_ARRAY_BUFFER, iVBO);
+        glBufferData(GL_ARRAY_BUFFER, iNbVertex*3*sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+        
+        cudaError_t cudaStatus = cudaGraphicsGLRegisterBuffer(
+            &oCudaRsc, iVBO, cudaGraphicsRegisterFlagsWriteDiscard);
+        assert(cudaStatus == cudaSuccess);
 
-int main(int argc, char* argv[]) {
-    // glfw: initialize and configure
-    // ------------------------------
-    glfwInit();
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3*sizeof(float), (void*)0);
+        glEnableVertexAttribArray(0);
+
+        glBindVertexArray(0);
+    }
+
+    void initTBO(GLuint& iTBO, GLuint& iTEX, int iNbTriangle, cudaGraphicsResource_t& oCudaRsc) {
+        glGenBuffers(1, &iTBO);
+        glBindBuffer(GL_TEXTURE_BUFFER, iTBO);
+        glBufferData(GL_TEXTURE_BUFFER, iNbTriangle*sizeof(int), nullptr, GL_DYNAMIC_DRAW);
+
+        glGenTextures(1, &iTEX);
+        glBindTexture(GL_TEXTURE_BUFFER, iTEX);
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_R32I, iTBO);
+
+        cudaError_t cudaStatus = cudaGraphicsGLRegisterBuffer(
+            &oCudaRsc, iTBO, cudaGraphicsRegisterFlagsWriteDiscard);
+        assert(cudaStatus == cudaSuccess);
+    }
+
+    // 清理VBO资源
+    void cleanupVBO(GLuint& iVBO, cudaGraphicsResource_t& iCUDAresource) {
+        cudaGraphicsUnregisterResource(iCUDAresource);
+        glDeleteBuffers(1, &iVBO);
+    }
+
+    // process all input: query GLFW whether relevant keys are pressed/released this frame and react accordingly
+    // ---------------------------------------------------------------------------------------------------------
+    void processInput(GLFWwindow* window) {
+        if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+            glfwSetWindowShouldClose(window, true);
+
+        // Toggle mouse capture with F1 key
+        static bool f1Pressed = false;
+        if (glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS) {
+            if (!f1Pressed) {
+                _mouseCaptured = !_mouseCaptured;
+                glfwSetInputMode(window, GLFW_CURSOR, _mouseCaptured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+                f1Pressed = true;
+            }
+        } else {
+            f1Pressed = false;
+        }
+
+        // Only process camera movement when mouse is captured (not interacting with UI)
+        if (_mouseCaptured) {
+            float cameraSpeed = static_cast<float>(2.5 * _deltaTime);
+            if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+                _cameraPos += cameraSpeed * _cameraFront;
+            if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+                _cameraPos -= cameraSpeed * _cameraFront;
+            if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+                _cameraPos -= glm::normalize(glm::cross(_cameraFront, _cameraUp)) * cameraSpeed;
+            if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+                _cameraPos += glm::normalize(glm::cross(_cameraFront, _cameraUp)) * cameraSpeed;
+        }
+    }
+
+public:
+    Application() = default;
+    ~Application() {
+        // Cleanup resources
+        if (_window) {
+            // optional: de-allocate all resources once they've outlived their purpose:
+            // ------------------------------------------------------------------------
+            for (int i = 0; i < 2; ++i) {
+                if (_VAO[i]) {
+                    glDeleteVertexArrays(1, &_VAO[i]);
+                }
+                if (_VAOBox[i]) {
+                    glDeleteVertexArrays(1, &_VAOBox[i]);
+                }
+                if (_TEX[i]) {
+                    glDeleteTextures(1, &_TEX[i]);
+                }
+                if (_texture[i]) {
+                    glDeleteTextures(1, &_texture[i]);
+                }
+                // 清理VBO资源
+                if (_VBO[i] && _cudaRsc[i]) {
+                    cleanupVBO(_VBO[i], _cudaRsc[i]);
+                }
+                if (_VBOBox[i] && _cudaRscBox[i]) {
+                    cleanupVBO(_VBOBox[i], _cudaRscBox[i]);
+                }
+                if (_TBO[i]) {
+                    glDeleteBuffers(1, &_TBO[i]);
+                }
+                if (_obj[i]) {
+                    delete _obj[i];
+                }
+            }
+
+            if (_ourShader) {
+                delete _ourShader;
+            }
+            // Cleanup ImGui
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+
+            // glfw: terminate, clearing all previously allocated GLFW resources.
+            // ------------------------------------------------------------------
+            glfwTerminate();
+        }
+    }
+
+    // Initialize the application
+    bool init() {
+        // glfw: initialize and configure
+        // ------------------------------
+        glfwInit();
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
 #ifdef __APPLE__
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 #endif
 
-    // glfw window creation
-    // --------------------
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT, "Interfere Detection", NULL, NULL);
-    if (window == NULL) {
-        std::cout << "Failed to create GLFW window" << std::endl;
-        glfwTerminate();
-        return -1;
+        // glfw window creation
+        // --------------------
+        _window = glfwCreateWindow(_scrWidth, _scrHeight, "Interfere Detection", NULL, NULL);
+        if (_window == NULL) {
+            std::cout << "Failed to create GLFW window" << std::endl;
+            glfwTerminate();
+            return false;
+        }
+        glfwMakeContextCurrent(_window);
+
+        // Set user pointer to this Application instance for callbacks
+        glfwSetWindowUserPointer(_window, this);
+
+        // Set callbacks
+        glfwSetFramebufferSizeCallback(_window, framebuffer_size_callback_wrapper);
+        glfwSetCursorPosCallback(_window, mouse_callback_wrapper);
+        glfwSetScrollCallback(_window, scroll_callback_wrapper);
+        glfwSetWindowRefreshCallback(_window, window_refresh_callback_wrapper);
+
+        // tell GLFW to capture our mouse
+        glfwSetInputMode(_window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+
+        // glad: load all OpenGL function pointers
+        // ---------------------------------------
+        if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
+            std::cout << "Failed to initialize GLAD" << std::endl;
+            return false;
+        }
+
+        // Setup Dear ImGui context
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO(); (void)io;
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+        // Setup Dear ImGui style
+        ImGui::StyleColorsDark();
+
+        // Setup Platform/Renderer backends
+        ImGui_ImplGlfw_InitForOpenGL(_window, true);
+        ImGui_ImplOpenGL3_Init("#version 330");
+
+        // configure global opengl state
+        // -----------------------------
+        glEnable(GL_DEPTH_TEST);
+
+        // build and compile our shader zprogram
+        // ------------------------------------
+        _ourShader = new Shader("shader.vs", "shader.fs");
+
+        // load and create a texture 
+        // -------------------------
+        // texture 1
+        // ---------
+        glGenTextures(1, &_texture[0]);
+        glBindTexture(GL_TEXTURE_2D, _texture[0]);
+        // set the texture wrapping parameters
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        // set texture filtering parameters
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // load image, create texture and generate mipmaps
+        int width, height, nrChannels;
+        stbi_set_flip_vertically_on_load(true); // tell stb_image.h to flip loaded texture's on the y-axis.
+        unsigned char* data = stbi_load("container.jpg", &width, &height, &nrChannels, 0);
+        if (data) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+            glGenerateMipmap(GL_TEXTURE_2D);
+        } else {
+            std::cout << "Failed to load texture" << std::endl;
+        }
+        stbi_image_free(data);
+        // texture 2
+        // ---------
+        glGenTextures(1, &_texture[1]);
+        glBindTexture(GL_TEXTURE_2D, _texture[1]);
+        // set the texture wrapping parameters
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+        // set texture filtering parameters
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // load image, create texture and generate mipmaps
+        data = stbi_load("awesomeface.png", &width, &height, &nrChannels, 0);
+        if (data) {
+            // note that the awesomeface.png has transparency and thus an alpha channel, so make sure to tell OpenGL the data type is of GL_RGBA
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+            glGenerateMipmap(GL_TEXTURE_2D);
+        } else {
+            std::cout << "Failed to load texture" << std::endl;
+        }
+        stbi_image_free(data);
+
+        // tell opengl for each sampler to which texture unit it belongs to (only has to be done once)
+        // -------------------------------------------------------------------------------------------
+        _ourShader->use();
+        _ourShader->setInt("texture1", 0);
+        _ourShader->setInt("texture2", 1);
+
+        glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        
+        int device = 0;
+        cudaDeviceProp prop;
+        // 获取当前设备的 ID
+        cudaGetDevice(&device);
+        // 获取设备属性
+        cudaGetDeviceProperties(&prop, device);
+        // 获取最大线程块大小
+        _maxThreadsPerBlock = prop.maxThreadsPerBlock;
+
+        _obj[0] = new ObjLoader("object1_nut.stl");
+        _obj[1] = new ObjLoader("object2_wrench.stl");
+
+        for (int i = 0; i < 2; ++i) {
+            _triNum[i] = _obj[i]->_tris.size();
+            initVBOfloat3(_VAO[i], _VBO[i], _triNum[i] * 3, _cudaRsc[i]);
+            initVBOfloat3(_VAOBox[i], _VBOBox[i], _triNum[i] * 48, _cudaRscBox[i]);
+            initTBO(_TBO[i], _TEX[i], _triNum[i], _cudaRscHit[i]);
+        }
+
+        return true;
     }
-    glfwMakeContextCurrent(window);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-    glfwSetCursorPosCallback(window, mouse_callback);
-    glfwSetScrollCallback(window, scroll_callback);
 
-    // tell GLFW to capture our mouse
-    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
-
-    // glad: load all OpenGL function pointers
-    // ---------------------------------------
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
-        std::cout << "Failed to initialize GLAD" << std::endl;
-        return -1;
-    }
-
-    // configure global opengl state
-    // -----------------------------
-    glEnable(GL_DEPTH_TEST);
-
-    // build and compile our shader zprogram
-    // ------------------------------------
-    Shader ourShader("shader.vs", "shader.fs");
-
-    // load and create a texture 
-    // -------------------------
-    unsigned int texture1, texture2;
-    // texture 1
-    // ---------
-    glGenTextures(1, &texture1);
-    glBindTexture(GL_TEXTURE_2D, texture1);
-    // set the texture wrapping parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    // set texture filtering parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    // load image, create texture and generate mipmaps
-    int width, height, nrChannels;
-    stbi_set_flip_vertically_on_load(true); // tell stb_image.h to flip loaded texture's on the y-axis.
-    unsigned char* data = stbi_load("container.jpg", &width, &height, &nrChannels, 0);
-    if (data) {
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);
-    } else {
-        std::cout << "Failed to load texture" << std::endl;
-    }
-    stbi_image_free(data);
-    // texture 2
-    // ---------
-    glGenTextures(1, &texture2);
-    glBindTexture(GL_TEXTURE_2D, texture2);
-    // set the texture wrapping parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    // set texture filtering parameters
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    // load image, create texture and generate mipmaps
-    data = stbi_load("awesomeface.png", &width, &height, &nrChannels, 0);
-    if (data) {
-        // note that the awesomeface.png has transparency and thus an alpha channel, so make sure to tell OpenGL the data type is of GL_RGBA
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);
-    } else {
-        std::cout << "Failed to load texture" << std::endl;
-    }
-    stbi_image_free(data);
-
-    // tell opengl for each sampler to which texture unit it belongs to (only has to be done once)
-    // -------------------------------------------------------------------------------------------
-    ourShader.use();
-    ourShader.setInt("texture1", 0);
-    ourShader.setInt("texture2", 1);
-
-    // pass projection matrix to shader (as projection matrix rarely changes there's no need to do this per frame)
-    // -----------------------------------------------------------------------------------------------------------
-    glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
-    ourShader.setMat4("projection", projection);
-
-    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    
-    int device = 0;
-    cudaDeviceProp prop;
-    // 获取当前设备的 ID
-    cudaGetDevice(&device);
-    // 获取设备属性
-    cudaGetDeviceProperties(&prop, device);
-    // 获取最大线程块大小
-    int maxThreadsPerBlock = prop.maxThreadsPerBlock;
-
-    ObjLoader obj1("object1_debug.stl"), obj2("object2_debug.stl");
-
-    GLuint VBO1, VBO2, VBOBox1, VBOBox2, VAO1, VAO2, VAOBox1, VAOBox2, TBO1, TBO2, TEX1, TEX2;
-    cudaGraphicsResource_t cudaRsc1, cudaRsc2, cudaRscBox1, cudaRscBox2, cudaRscHit1, cudaRscHit2;
-    initVBOfloat3(VAO1, VBO1, obj1._tris.size()*3, cudaRsc1);
-    initVBOfloat3(VAO2, VBO2, obj2._tris.size()*3, cudaRsc2);
-    initVBOfloat3(VAOBox1, VBOBox1, obj1._tris.size()*48, cudaRscBox1);
-    initVBOfloat3(VAOBox2, VBOBox2, obj2._tris.size()*48, cudaRscBox2);
-    initTBO(TBO1, TEX1, obj1._tris.size(), cudaRscHit1);
-    initTBO(TBO2, TEX2, obj2._tris.size(), cudaRscHit2);
-    // render loop
-    // -----------
-    while (!glfwWindowShouldClose(window)) {
+    // Render function that can be called from both main loop and refresh callback
+    void render() {
+        float3 *pVertTri[2]{nullptr, nullptr}, *pVertBox[2]{nullptr, nullptr};
+        int *pHit[2]{nullptr, nullptr};
+        size_t sizeTri[2]{0, 0}, sizeBox[2]{0, 0}, sizeHit[2]{0, 0};
+        
         // Map buffer object for writing from CUDA
-        cudaGraphicsMapResources(1, &cudaRsc1, 0);
-        cudaGraphicsMapResources(1, &cudaRsc2, 0);
-        cudaGraphicsMapResources(1, &cudaRscBox1, 0);
-        cudaGraphicsMapResources(1, &cudaRscBox2, 0);
-        cudaGraphicsMapResources(1, &cudaRscHit1, 0);
-        cudaGraphicsMapResources(1, &cudaRscHit2, 0);
-        float3 *pVertTri1 = nullptr, *pVertTri2 = nullptr, *pVertBox1 = nullptr, *pVertBox2 = nullptr;
-		int *pHit1 = nullptr, *pHit2 = nullptr;
-        size_t sizeTri1=0, sizeTri2=0, sizeBox1=0, sizeBox2=0, sizeHit1=0, sizeHit2=0;
-        cudaGraphicsResourceGetMappedPointer((void**)&pVertTri1, &sizeTri1, cudaRsc1);
-        cudaGraphicsResourceGetMappedPointer((void**)&pVertTri2, &sizeTri2, cudaRsc2);
-        cudaGraphicsResourceGetMappedPointer((void**)&pVertBox1, &sizeBox1, cudaRscBox1);
-        cudaGraphicsResourceGetMappedPointer((void**)&pVertBox2, &sizeBox2, cudaRscBox2);
-        cudaGraphicsResourceGetMappedPointer((void**)&pHit1, &sizeHit1, cudaRscHit1);
-        cudaGraphicsResourceGetMappedPointer((void**)&pHit2, &sizeHit2, cudaRscHit2);
+        for (int i = 0; i < 2; ++i) {
+            cudaGraphicsMapResources(1, &_cudaRsc[i], 0);
+            cudaGraphicsMapResources(1, &_cudaRscBox[i], 0);
+            cudaGraphicsMapResources(1, &_cudaRscHit[i], 0);
+            cudaGraphicsResourceGetMappedPointer((void**)&pVertTri[i], &sizeTri[i], _cudaRsc[i]);
+            cudaGraphicsResourceGetMappedPointer((void**)&pVertBox[i], &sizeBox[i], _cudaRscBox[i]);
+            cudaGraphicsResourceGetMappedPointer((void**)&pHit[i], &sizeHit[i], _cudaRscHit[i]);
+        }
+        
+        float time = glfwGetTime();
+        //float time = 0;
 
         glm::mat4 model = glm::mat4(1.0f);
         model = glm::translate(model, glm::vec3(0.0f, 0.0f, 0.0f));
-        //ourShader.setMat4("model", model);
-        CudaBVH* myBVH  = new CudaBVH(&obj1._tris, obj1._tris.size(), maxThreadsPerBlock, glm::value_ptr(model), pVertTri1, pVertBox1);
+        CudaBVH* arrBVH[2]{nullptr, nullptr};
+        arrBVH[0] = new CudaBVH(&_obj[0]->_tris, &_obj[0]->_box, _triNum[0], _maxThreadsPerBlock, glm::value_ptr(model), pVertTri[0], pVertBox[0]);
+
         model = glm::mat4(1.0f);
-        model = glm::translate(model, glm::vec3(0.0f, 0.0f, 0.0f));
-        //ourShader.setMat4("model", model);
-        CudaBVH* myBVH2 = new CudaBVH(&obj2._tris, obj2._tris.size(), maxThreadsPerBlock, glm::value_ptr(model), pVertTri2, pVertBox2);
+        model = glm::translate(model, glm::vec3(_modelParams.translateX, _modelParams.translateY, _modelParams.translateZ));
+        model = glm::rotate(model, _modelParams.rotateAngle+cos(time/2)/20, glm::vec3(_modelParams.rotateX, _modelParams.rotateY, _modelParams.rotateZ));
+        model = glm::translate(model, glm::vec3(-44.31f, -4.7f, 0.0f));
+        model = glm::scale(model, glm::vec3(_modelParams.scale, _modelParams.scale, _modelParams.scale));
+        arrBVH[1] = new CudaBVH(&_obj[1]->_tris, &_obj[1]->_box, _triNum[1], _maxThreadsPerBlock, glm::value_ptr(model), pVertTri[1], pVertBox[1]);
         
-        myBVH->boxIntersect(myBVH2->_SampleSize, myBVH2->d_BBoxLeaf, myBVH2->d_mesh, pHit2, pHit1);
-        cudaDeviceSynchronize();
+        arrBVH[0]->boxIntersect(arrBVH[1]->_SampleSize, arrBVH[1]->d_BBoxLeaf, arrBVH[1]->d_mesh, pHit[1], pHit[0]);
 
+#ifndef DEBUG
+        static double timeCost[2][5][2] = {
+            {{0.0, 0.0},{0.0, 0.0},{0.0, 0.0},{0.0, 0.0},{0.0, 0.0}},
+            {{0.0, 0.0},{0.0, 0.0},{0.0, 0.0},{0.0, 0.0},{0.0, 0.0}}};
+        static double avgTime[2][5] = {{0.0, 0.0, 0.0, 0.0, 0.0},{0.0, 0.0, 0.0, 0.0, 0.0}};
+		for (int i = 0; i < 2; ++i) {
+			for (int j = 0; j < 5; ++j) {
+				timeCost[i][j][0] += arrBVH[i]->_TimeCost[j][0];
+				timeCost[i][j][1] += arrBVH[i]->_TimeCost[j][1];
+				if (timeCost[i][j][0] > 250) {
+					avgTime[i][j] = timeCost[i][j][0] / timeCost[i][j][1];
+					timeCost[i][j][0] = 0.0;
+					timeCost[i][j][1] = 0.0;
+				}
+			}
+		}
 
+        static bool firstPrint = true;
+        if (firstPrint) {
+            std::cout << "============================================================================================" << std::endl;
+            std::cout << "                                 Performance Timing Results (ms)                            " << std::endl;
+            std::cout << "--------------------------------------------------------------------------------------------" << std::endl;
+            std::cout << "Object| GenerateMorton |    Radixsort   |GenerateHierachy|   InternalBox  |NodeTreeIntersect" << std::endl;
+            std::cout << "--------------------------------------------------------------------------------------------" << std::endl;
+            firstPrint = false;
+        }
+        for (int i = 0; i < 2; ++i) {
+            printf("   %d  |    %8.4f    |    %8.4f    |    %8.4f    |    %8.4f    |    %8.4f     ",
+                i, avgTime[i][0], avgTime[i][1], avgTime[i][2], avgTime[i][3], avgTime[i][4]);
+            std::cout << std::endl;
+		}
 
+        std::cout << "\033[2A";  // Move cursor up 2 lines
+        std::cout.flush();
+#endif
 
-
-
-
-		//int* h_hit1 = new int[myBVH->_SampleSize];
-		//int* h_hit2 = new int[myBVH2->_SampleSize];
-		//cudaMemcpy(h_hit1, pHit1, myBVH->_SampleSize * sizeof(int), cudaMemcpyDeviceToHost);
-		//cudaMemcpy(h_hit2, pHit2, myBVH2->_SampleSize * sizeof(int), cudaMemcpyDeviceToHost);
-  //      cudaDeviceSynchronize();
-  //      for(int i = 0; i < myBVH->_SampleSize; i++) {
-  //          std::cout << "h_hit1[" << i << "]=" << h_hit1[i] << std::endl;
-  //      }
-  //      for (int i = 0; i < myBVH2->_SampleSize; i++) {
-  //          std::cout << "h_hit2[" << i << "]=" << h_hit2[i] << std::endl;
-  //      }
-		//delete[] h_hit1;
-		//delete[] h_hit2;
-		//h_hit1 = nullptr;
-		//h_hit2 = nullptr;
-
-
-
-
-
-
-        cudaGraphicsUnmapResources(1, &cudaRsc1, 0);
-        cudaGraphicsUnmapResources(1, &cudaRsc2, 0);
-        cudaGraphicsUnmapResources(1, &cudaRscBox1, 0);
-        cudaGraphicsUnmapResources(1, &cudaRscBox2, 0);
-        cudaGraphicsUnmapResources(1, &cudaRscHit1, 0);
-        cudaGraphicsUnmapResources(1, &cudaRscHit2, 0);
-
-
-
-
-
-
-//// 在 boxIntersect 调用后添加调试
-//int* debug_data1 = new int[myBVH->_SampleSize];
-//int* debug_data2 = new int[myBVH2->_SampleSize];
-//
-//glBindBuffer(GL_TEXTURE_BUFFER, TBO1);
-//glGetBufferSubData(GL_TEXTURE_BUFFER, 0, myBVH->_SampleSize * sizeof(int), debug_data1);
-//printf("TBO1 data: %d %d\n", debug_data1[0], debug_data1[1]);
-//
-//glBindBuffer(GL_TEXTURE_BUFFER, TBO2);
-//glGetBufferSubData(GL_TEXTURE_BUFFER, 0, myBVH2->_SampleSize * sizeof(int), debug_data2);
-//printf("TBO2 data: %d %d\n", debug_data2[0], debug_data2[1]);
-//
-//delete[] debug_data1;
-//delete[] debug_data2;
-//debug_data1 = nullptr;
-//debug_data2 = nullptr;
-
-
-
-
-
-
+        for (int i = 0; i < 2; ++i) {
+            cudaGraphicsUnmapResources(1, &_cudaRsc[i], 0);
+            cudaGraphicsUnmapResources(1, &_cudaRscBox[i], 0);
+            cudaGraphicsUnmapResources(1, &_cudaRscHit[i], 0);
+		}
 
         // per-frame time logic
         // --------------------
         float currentFrame = static_cast<float>(glfwGetTime());
-        deltaTime = currentFrame - lastFrame;
-        lastFrame = currentFrame;
+        _deltaTime = currentFrame - _lastFrame;
+        _lastFrame = currentFrame;
 
         // input
         // -----
-        processInput(window);
+        processInput(_window);
 
         // render
         // ------
@@ -370,88 +498,124 @@ int main(int argc, char* argv[]) {
         
         // bind textures on corresponding texture units
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, texture1);
+        glBindTexture(GL_TEXTURE_2D, _texture[0]);
         glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, texture2);
+        glBindTexture(GL_TEXTURE_2D, _texture[1]);
 
         // activate shader
-        ourShader.use();
+        _ourShader->use();
 
         // pass projection matrix to shader (note that in this case it could change every frame)
-        glm::mat4 projection = glm::perspective(glm::radians(fov), (float)SCR_WIDTH / (float)SCR_HEIGHT, 0.1f, 100.0f);
-        ourShader.setMat4("projection", projection);
+        glm::mat4 projection = glm::perspective(glm::radians(_fov), (float)_scrWidth / (float)_scrHeight, 0.1f, 100.0f);
+        _ourShader->setMat4("projection", projection);
 
         // camera/view transformation
-        glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
-        ourShader.setMat4("view", view);
-
-        // 渲染第一个物体
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_BUFFER, TEX1);
-        ourShader.setInt("triHitBuffer", 2);
-
-        glBindVertexArray(VAO1);
-        // 计算三角形数量并绘制
-        int triangleCount1 = myBVH->_SampleSize;
-		ourShader.setFloat4("color", 1.0f, 0.0f, 0.0f, 1.0f);
-		ourShader.setInt("nbVertexPerElement", 3);
-        glDrawArrays(GL_TRIANGLES, 0, triangleCount1 * 3);
+        glm::mat4 view = glm::lookAt(_cameraPos, _cameraPos + _cameraFront, _cameraUp);
+        _ourShader->setMat4("view", view);
         
-        glBindVertexArray(VAOBox1);
-		ourShader.setFloat4("color", 0.0f, 0.0f, 1.0f, 0.2f);
-        ourShader.setInt("nbVertexPerElement", 24);
-        //glDrawArrays(GL_LINES, 0, triangleCount1 * 48);
-        glDrawArrays(GL_LINES, 0, triangleCount1 * 24);
+        // 渲染物体
+        for (int i = 0; i < 2; ++i) {
+            glActiveTexture(GL_TEXTURE2 + i);
+            glBindTexture(GL_TEXTURE_BUFFER, _TEX[i]);
+            _ourShader->setInt("triHitBuffer", 2 + i);
 
-        // 渲染第二个物体（稍微偏移以避免重叠）
-        glActiveTexture(GL_TEXTURE3);
-        glBindTexture(GL_TEXTURE_BUFFER, TEX2);
-        ourShader.setInt("triHitBuffer", 3);
+            glBindVertexArray(_VAO[i]);
+            // 计算三角形数量并绘制
+            int triangleCount = arrBVH[i]->_SampleSize;
+            _ourShader->setFloat4("color", _colorObj[0], _colorObj[1], _colorObj[2], _colorObj[3]);
+            _ourShader->setFloat4("colorHit", _colorHit[0], _colorHit[1], _colorHit[2], _colorHit[3]);
+            _ourShader->setInt("nbVertexPerElement", 3);
+            glDrawArrays(GL_TRIANGLES, 0, triangleCount * 3);
 
-        glBindVertexArray(VAO2);
+            glBindVertexArray(_VAOBox[i]);
+            _ourShader->setFloat4("color", _colorBox[0], _colorBox[1], _colorBox[2], _colorBox[3]);
+            _ourShader->setFloat4("colorHit", _colorHit[0], _colorHit[1], _colorHit[2], _colorHit[3]);
+            _ourShader->setInt("nbVertexPerElement", 24);
+            glDrawArrays(GL_LINES, 0, triangleCount * 24);
+        }
+
+        // Start ImGui frame
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        // Create ImGui control panel
+        ImGui::Begin("Model Matrix Controls");
         
-        int triangleCount2 = myBVH2->_SampleSize;
-        ourShader.setFloat4("color", 1.0f, 0.0f, 0.0f, 1.0f);
-        ourShader.setInt("nbVertexPerElement", 3);
-        glDrawArrays(GL_TRIANGLES, 0, triangleCount2 * 3);
+        // Display FPS
+        float fps = 1.0f / _deltaTime;
+        ImGui::Text("FPS: %.1f", fps);
+        ImGui::Text("Frame Time: %.3f ms", _deltaTime * 1000.0f);
+        ImGui::Separator();
+        
+        ImGui::Text("Adjust Object 2 (Wrench) Transform");
+        ImGui::Separator();
+        
+        ImGui::Text("Translation");
+        ImGui::SliderFloat("Translate X", &_modelParams.translateX, -15.381198f, 24.618802f);
+        ImGui::SliderFloat("Translate Y", &_modelParams.translateY, -16.0f, 24.0f);
+        ImGui::SliderFloat("Translate Z", &_modelParams.translateZ, -20.0f, 20.0f);
+        
+        ImGui::Separator();
+        ImGui::Text("Rotation");
+        ImGui::SliderFloat("Rotate Angle", &_modelParams.rotateAngle, -4.9816f, 1.3016f);
+        ImGui::SliderFloat("Rotate Axis X", &_modelParams.rotateX, -1.0f, 1.0f);
+        ImGui::SliderFloat("Rotate Axis Y", &_modelParams.rotateY, -1.0f, 1.0f);
+        ImGui::SliderFloat("Rotate Axis Z", &_modelParams.rotateZ, -1.0f, 1.0f);
+        
+        ImGui::Separator();
+        ImGui::Text("Scale");
+        ImGui::SliderFloat("scale", &_modelParams.scale, 0.5f, 3.0f);
+        
+        ImGui::Separator();
+        if (ImGui::Button("Reset to Default")) {
+            _modelParams.translateX = 4.618802f;
+            _modelParams.translateY = 4.0f;
+            _modelParams.translateZ = 0.0f;
+            _modelParams.rotateAngle = -1.84f;
+            _modelParams.rotateX = 0.0f;
+            _modelParams.rotateY = 0.0f;
+            _modelParams.rotateZ = 1.0f;
+            _modelParams.scale = 1.75f;
+        }
+        
+        ImGui::Separator();
+        ImGui::Text("Press F1 to toggle mouse capture");
+        ImGui::Text("Current: %s", _mouseCaptured ? "Camera Control" : "UI Interaction");
+        
+        ImGui::End();
 
-        glBindVertexArray(VAOBox2);
-        ourShader.setFloat4("color", 0.0f, 0.0f, 1.0f, 0.2f);
-        ourShader.setInt("nbVertexPerElement", 24);
-        //glDrawArrays(GL_LINES, 0, triangleCount2 * 48);
-        glDrawArrays(GL_LINES, 0, triangleCount2 * 24);
+        // Render ImGui
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-        // glfw: swap buffers and poll IO events (keys pressed/released, mouse moved etc.)
-        // -------------------------------------------------------------------------------
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-
-        delete (myBVH); delete (myBVH2);
+        delete (arrBVH[0]);
+        delete (arrBVH[1]);
     }
 
-    // optional: de-allocate all resources once they've outlived their purpose:
-    // ------------------------------------------------------------------------
-    glDeleteVertexArrays(1, &VAO1);
-    glDeleteVertexArrays(1, &VAO2);
-    glDeleteVertexArrays(1, &VAOBox1);
-    glDeleteVertexArrays(1, &VAOBox2);
-    glDeleteTextures(1, &TEX1);
-    glDeleteTextures(1, &TEX2);
-    glDeleteTextures(1, &texture1);
-    glDeleteTextures(1, &texture2);
-    
-    // 清理VBO资源
-    cleanupVBO(VBO1, cudaRsc1);
-    cleanupVBO(VBO2, cudaRsc2);
-    cleanupVBO(VBOBox1, cudaRscBox1);
-    cleanupVBO(VBOBox2, cudaRscBox2);
-	glDeleteBuffers(1, &TBO1);
-	glDeleteBuffers(1, &TBO2);
+    // Main run loop
+    void run() {
+        // render loop
+        // -----------
+        while (!glfwWindowShouldClose(_window)) {
+            render();
+            
+            // glfw: swap buffers and poll IO events (keys pressed/released, mouse moved etc.)
+            // -------------------------------------------------------------------------------
+            glfwSwapBuffers(_window);
+            glfwPollEvents();
+        }
 
-    // glfw: terminate, clearing all previously allocated GLFW resources.
-    // ------------------------------------------------------------------
-    glfwTerminate();
+        std::cout << std::endl;
+    }
+};
 
+int main(int argc, char* argv[]) {
+    //freopen("D:\\File\\Graduation_Project\\interfereDetection\\debug.log", "w", stdout);
+    Application app;
+    if (app.init()) {
+        app.run();
+    }
 	checkCudaErrors(cudaDeviceReset());
 	return 0;
 }

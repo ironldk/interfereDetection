@@ -8,6 +8,7 @@ uniform sampler2D texture1;
 uniform sampler2D texture2;
 
 uniform vec4 color;
+uniform vec4 colorHit;
 uniform isamplerBuffer triHitBuffer;
 
 void main() {
@@ -15,10 +16,8 @@ void main() {
 	//FragColor = mix(texture(texture1, TexCoord), texture(texture2, TexCoord), 0.2);
 
 	int hit = texelFetch(triHitBuffer, triID).r;
-	if (hit == 1){
-		FragColor = vec4(1.0, 1.0, 1.0, color.a); // White for hit
-		//FragColor = color;
-	} else {
-		FragColor = color;
-	}
+	vec4 arrColor[2];
+	arrColor[0]= color;
+	arrColor[1]= colorHit;
+	FragColor = arrColor[hit];
 }

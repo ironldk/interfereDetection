@@ -5,77 +5,101 @@
 #include <math.h>
 #include "Triangle.cuh"
 
+#pragma pack(push, 1)
 class BBox {
 	friend class ObjLoader;
 public:
 	__host__ __device__ BBox(
-		float x0 = 0.0, float x1 = 0.0,
-		float y0 = 0.0, float y1 = 0.0,
-		float z0 = 0.0, float z1 = 0.0
+		float x0 = FLT_MAX, float x1 = FLT_MIN,
+		float y0 = FLT_MAX, float y1 = FLT_MIN,
+		float z0 = FLT_MAX, float z1 = FLT_MIN
 	): _min(x0, y0, z0), _max(x1, y1, z1) {}
 
 	__host__ __device__ BBox(const Triangle& iT);
 	__host__ __device__ BBox(const Point& iPt1, const Point& iPt2);
-
-	BBox& operator+=(const Point& pt);
-	BBox& operator-=(const Point& pt);
-	BBox& operator*=(const float& scale);
 
 	__host__ __device__ BBox& Union(const BBox& b);
 	__host__ __device__ BBox& Union(const Point& iPt);
 
 	__host__ __device__ bool Intersect(const BBox& b) const;
 
-	float LargestEdge();
-	const Point& GetMin();
 	__host__ __device__ void Complete();
 
 	__host__ __device__ void GetCenter(float& ox, float& oy, float& oz) const;
+	__host__ __device__ void ComputeMin(float iMatrixModel[16], float oMin[3]) const;
 
+#ifndef DEBUG
 private:
+#endif
 	Point
 		_min , _x100, _x001, _x101, _x010, _x110, _x011, _max ,
 		_y000, _y010, _y001, _y011, _y100, _y110, _y101, _y111,
 		_z000, _z001, _z010, _z011, _z100, _z101, _z110, _z111;
 };
+#pragma pack(pop)
+
+// 静态断言验证BBox的内存布局
+static_assert(sizeof(BBox) == 24 * 12, "BBox size must be 288 bytes (24 Points x 12 bytes)");
 
 inline __host__ __device__ BBox::BBox(const Triangle& iT) : BBox(iT.a, iT.b) {
 	Union(iT.c);
 }
 
 inline __host__ __device__ BBox::BBox(const Point& iPt1, const Point& iPt2) {
-	if (iPt1.x < iPt2.x) { _min.x = iPt1.x; _max.x = iPt2.x; } else { _max.x = iPt1.x; _min.x = iPt2.x; }
-	if (iPt1.y < iPt2.y) { _min.y = iPt1.y; _max.y = iPt2.y; } else { _max.y = iPt1.y; _min.y = iPt2.y; }
-	if (iPt1.z < iPt2.z) { _min.z = iPt1.z; _max.z = iPt2.z; } else { _max.z = iPt1.z; _min.z = iPt2.z; }
+	float arr[3][2]{{iPt1.x, iPt2.x}, {iPt1.y, iPt2.y}, {iPt1.z, iPt2.z}};
+	bool select[3]{iPt1.x < iPt2.x, iPt1.y < iPt2.y, iPt1.z < iPt2.z};
+	_min.x = arr[0][1-select[0]];
+	_max.x = arr[0][  select[0]];
+	_min.y = arr[1][1-select[1]];
+	_max.y = arr[1][  select[1]];
+	_min.z = arr[2][1-select[2]];
+	_max.z = arr[2][  select[2]];
 }
 
 inline __host__ __device__ BBox& BBox::Union(const BBox& b) {
-	if (_min.x > b._min.x) { _min.x = b._min.x; }
-	if (_max.x < b._max.x) { _max.x = b._max.x; }
-	if (_min.y > b._min.y) { _min.y = b._min.y; }
-	if (_max.y < b._max.y) { _max.y = b._max.y; }
-	if (_min.z > b._min.z) { _min.z = b._min.z; }
-	if (_max.z < b._max.z) { _max.z = b._max.z; }
+	bool select[6]{
+		_min.x > b._min.x, _min.y > b._min.y, _min.z > b._min.z,
+		_max.x < b._max.x, _max.y < b._max.y, _max.z < b._max.z
+	};
+	float arr[6][2]{
+		{_min.x, b._min.x}, {_min.y, b._min.y}, {_min.z, b._min.z},
+		{_max.x, b._max.x}, {_max.y, b._max.y}, {_max.z, b._max.z}
+	};
+	_min.x = arr[0][select[0]];
+	_min.y = arr[1][select[1]];
+	_min.z = arr[2][select[2]];
+	_max.x = arr[3][select[3]];
+	_max.y = arr[4][select[4]];
+	_max.z = arr[5][select[5]];
 	return *this;
 }
 
 inline __host__ __device__ BBox& BBox::Union(const Point& iPt) {
-	     if (_min.x > iPt.x) { _min.x = iPt.x; }
-	else if (_max.x < iPt.x) { _max.x = iPt.x; }
-	     if (_min.y > iPt.y) { _min.y = iPt.y; }
-	else if (_max.y < iPt.y) { _max.y = iPt.y; }
-	     if (_min.z > iPt.z) { _min.z = iPt.z; }
-	else if (_max.z < iPt.z) { _max.z = iPt.z; }
+	bool select[6]{
+		_min.x > iPt.x, _min.y > iPt.y, _min.z > iPt.z,
+		_max.x < iPt.x, _max.y < iPt.y, _max.z < iPt.z
+	};
+	float arr[6][2]{
+		{_min.x, iPt.x}, {_min.y, iPt.y}, {_min.z, iPt.z},
+		{_max.x, iPt.x}, {_max.y, iPt.y}, {_max.z, iPt.z}
+	};
+	_min.x = arr[0][select[0]];
+	_min.y = arr[1][select[1]];
+	_min.z = arr[2][select[2]];
+	_max.x = arr[3][select[3]];
+	_max.y = arr[4][select[4]];
+	_max.z = arr[5][select[5]];
 	return *this;
 }
 
 inline __host__ __device__ bool BBox::Intersect(const BBox& b) const {
 	// Exit with no intersection if separated along an axis
-	if (_max.x < b._min.x || _min.x > b._max.x) {return false;}
-	if (_max.y < b._min.y || _min.y > b._max.y) {return false;}
-	if (_max.z < b._min.z || _min.z > b._max.z) {return false;}
 	// Overlapping on all axes means AABBs are intersecting
-	return true;
+	return !(
+		(_max.x < b._min.x) + (_min.x > b._max.x) +
+		(_max.y < b._min.y) + (_min.y > b._max.y) +
+		(_max.z < b._min.z) + (_min.z > b._max.z)
+	);
 }
 
 inline __host__ __device__ void BBox::GetCenter(float& ox, float& oy, float& oz) const {
@@ -95,4 +119,15 @@ inline __host__ __device__ void BBox::Complete() {
 	_z111 = _y111 = _max;
 }
 
+inline __host__ __device__ void BBox::ComputeMin(float iMatrixModel[16], float oMin[3]) const {
+	Point arrBox[8]{ _min, _x001, _x010, _x011, _x100, _x101, _x110, _max };
+	for (int i = 0; i < 8; ++i) {
+		arrBox[i].Transform(iMatrixModel);
+		float arr[3][2]{{arrBox[i].x, oMin[0]}, {arrBox[i].y, oMin[1]}, {arrBox[i].z, oMin[2]}};
+		bool select[3]{arrBox[i].x > oMin[0], arrBox[i].y > oMin[1], arrBox[i].z > oMin[2]};
+		oMin[0] = arr[0][select[0]];
+		oMin[1] = arr[1][select[1]];
+		oMin[2] = arr[2][select[2]];
+	}
+}
 #endif

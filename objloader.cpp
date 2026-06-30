@@ -36,5 +36,7 @@ ObjLoader::ObjLoader(const std::string& iStr) {
 		ifs >> str;
 
 		_tris.push_back(std::move(t));
+		_box.Union(BBox(t));
 	}
+	_box.Complete();
 }

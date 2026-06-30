@@ -2,8 +2,13 @@
 #define _TRIANGLE_H_
 
 #include "Point.cuh"
+#include <cmath>
+#include <cuda_runtime.h>
+#include <cfloat>
+
 #define EPSILON 0.000000000001
 
+#pragma pack(push, 1)
 class Triangle {
 	friend class ObjLoader;
 	friend class BBox;
@@ -17,20 +22,27 @@ public:
 	Triangle& operator-=(const Point& orig);
 
 	__host__ __device__ Triangle& Transform(float iMatrixModel[16]);
+	
+	__host__ __device__ bool Intersect(const Triangle& iTri) const;
+	__host__ __device__ bool coplanar_tri_tri3d(const Point& iNormal, const Triangle& iTri) const;
+	__host__ __device__ float ORIENT_2D(float a[2], float b[2], float c[2]) const;
+	__host__ __device__ bool INTERSECTION_TEST_VERTEX(float P1[2], float Q1[2], float R1[2],
+		float P2[2], float Q2[2], float R2[2]) const;
+	__host__ __device__ bool INTERSECTION_TEST_EDGE(float P1[2], float Q1[2], float R1[2],
+		float P2[2], float Q2[2], float R2[2]) const;
+	__host__ __device__ bool ccw_tri_tri_intersection_2d(float p1[2], float q1[2], float r1[2],
+		float p2[2], float q2[2], float r2[2]) const;
+	__host__ __device__ bool tri_tri_overlap_test_2d(float p1[2], float p2[2]) const;
 
-	__host__ __device__ float f_clamp(float n, float min, float max) const;
-	
-	__host__ __device__ float edge_to_edge(Point p1, Point q1,
-		Point p2, Point q2, float& s, float& t, Point& c1, Point& c2) const;
-	
-	__host__ __device__ float point_to_triangle(Point pt, Point& ptt) const;
-	
-	// pr1,pr2 is nearest pair of points
-	__host__ __device__ bool Intersect(const Triangle& r) const;
-
+#ifndef DEBUG
 private:
+#endif
 	Point a, b, c;
 };
+#pragma pack(pop)
+
+// 静态断言验证Triangle的内存布局
+static_assert(sizeof(Triangle) == 36, "Triangle size must be 36 bytes (3 Points x 12 bytes)");
 
 inline __host__ __device__ Triangle& Triangle::Transform(float iMatrixModel[16]) {
 	a.Transform(iMatrixModel);
@@ -39,246 +51,303 @@ inline __host__ __device__ Triangle& Triangle::Transform(float iMatrixModel[16])
 	return *this;
 }
 
-inline __host__ __device__ float Triangle::f_clamp(float n, float min, float max) const {
-	if (n < min) {
-		return min;
-	} else if (n > max) {
-		return max;
-	} else {
-		return n;
-	}
+__inline__ __host__ __device__ bool CHECK_MIN_MAX(const Point& p1, const Point& q1, const Point& r1,
+	const Point& p2, const Point& q2, const Point& r2)
+{	
+	//      p1          p2
+	//     / \         / \
+	// ---i---j-------k---l------> L
+	//   /     \     /     \
+	//  r1-----q1   q2-----r2
+	// to make [i,j] intersect [k,l], we need k<=j and i<=l
+	return !(
+	// j >= k means |p1,q1,p2,q2| <= 0, so
+		(cross(q1 - p1, p2 - p1) * (q2 - p1) > 0.0f) +
+	// i <= l means |p1,r1,r2,p2| <= 0, so
+		(cross(r1 - p1, r2 - p1) * (p2 - p1) > 0.0f)
+	);
 }
 
-inline __host__ __device__ float Triangle::edge_to_edge(Point p1, Point q1,
-	Point p2, Point q2, float& s, float& t, Point& c1, Point& c2) const
+// Permutation in a canonical form of T2's vertices
+inline __host__ __device__ bool TRI_TRI_3D(const Point& p1, const Point& q1, const Point& r1,
+	const Point& p2, const Point& q2, const Point& r2, float dp2, float dq2, float dr2)
 {
-	Point d1 = q1 - p1; // Direction vector of segment S1
-	Point d2 = q2 - p2; // Direction vector of segment S2
-	Point r = p1 - p2;
-	float a = d1 * d1; // Squared length of segment S1, always nonnegative
-	float e = d2 * d2; // Squared length of segment S2, always nonnegative
-	float f = d2 * r;
-	// Check if either or both segments degenerate into points
-	if (a <= EPSILON && e <= EPSILON) {
-		// Both segments degenerate into points
-		s = t = 0.0f;
-		c1 = p1;
-		c2 = p2;
-		Point c2c1 = c1 - c2;
-		return c2c1 * c2c1;
-	} else if (a <= EPSILON) {
-		// First segment degenerates into a point
-		s = 0.0f;
-		t = f / e; // s = 0 => t = (b*s + f) / e = f / e
-		t = f_clamp(t, 0.0f, 1.0f);
-	} else if (e <= EPSILON) {
-		// Second segment degenerates into a point
-		t = 0.0f;
-		float c = d1 * r;
-		s = f_clamp(-c / a, 0.0f, 1.0f); // t = 0 => s = (b*t - c) / a = -c / a
-	} else {
-		// The general nondegenerate case starts here
-		float b = d1 * d2;
-		float c = d1 * r;
-		float denom = a * e - b * b; // Always nonnegative
-		// If segments not parallel, compute closest point on L1 to L2 and
-		// clamp to segment S1. Else pick arbitrary s (here 0)
-		if (denom != 0.0f) {
-			s = f_clamp((b * f - c * e) / denom, 0.0f, 1.0f);
+	const Point *a1=&p1, *b1=&q1, *c1=&r1, *a2=&p2, *b2=&q2, *c2=&r2;
+	if (dp2 > 0.0f) {
+		if (dq2 > 0.0f) {
+			b1=&r1; c1=&q1; a2=&r2; b2=&p2; c2=&q2;
+		} else if (dr2 > 0.0f) {
+			b1=&r1; c1=&q1; a2=&q2; b2=&r2; c2=&p2;
+		}
+	} else if (dp2 < 0.0f) {
+		if (dq2 < 0.0f) {
+			a2=&r2; b2=&p2; c2=&q2;
+		} else if (dr2 < 0.0f) {
+			a2=&q2; b2=&r2; c2=&p2;
 		} else {
-			s = 0.0f;
+			b1=&r1; c1=&q1;
 		}
-		// Compute point on L2 closest to S1(s) using
-		// t = Dot((P1 + D1*s) - P2,D2) / Dot(D2,D2) = (b*s + f) / e
-
-		// If t in [0,1] done. Else clamp t, recompute s for the new value
-		// of t using s = Dot((P2 + D2*t) - P1,D1) / Dot(D1,D1)= (t*b - c) / a
-		// and clamp s to [0, 1]
-		float tnom = b * s + f;
-		if (tnom < 0.0f) {
-			t = 0.0f;
-			s = f_clamp(-c / a, 0.0f, 1.0f);
-		}
-		else if (tnom > e) {
-			t = 1.0f;
-			s = f_clamp((b - c) / a, 0.0f, 1.0f);
-		}
-		else {
-			t = tnom / e;
+	} else {
+		if (dq2 < 0.0f) {
+			if (dr2 >= 0.0f) {
+				b1=&r1; c1=&q1; a2=&q2; b2=&r2; c2=&p2;
+			}
+		} else if (dq2 > 0.0f) {
+			if (dr2 > 0.0f) {
+				b1=&r1; c1=&q1;
+			} else {
+				a2=&q2; b2=&r2; c2=&p2;
+			}
+		} else {
+			if (dr2 > 0.0f) {
+				a2=&r2; b2=&p2; c2=&q2;
+			} else if (dr2 < 0.0f) {
+				b1=&r1; c1=&q1; a2=&r2; b2=&p2; c2=&q2;
+			} else {
+				// impossible case, coplanarity should have been handled before
+			}
 		}
 	}
-	c1 = p1 + d1*s;
-	c2 = p2 + d2*t;
-	Point c2c1 = c1 - c2;
-	return c2c1 * c2c1;
+	return CHECK_MIN_MAX(*a1, *b1, *c1, *a2, *b2, *c2);
 }
 
-inline __host__ __device__ float Triangle::point_to_triangle(Point pt, Point& ptt) const {
-	// Check if P in vertex region outside A
-	Point ab = b - a;
-	Point ac = c - a;
-	Point ap = pt - a;
-	float d1 = ab * ap;
-	float d2 = ac * ap;
-	if (d1 <= 0.0f && d2 <= 0.0f) {
-		ptt = a;
-		Point dist = pt - ptt;
-		return dist * dist; // barycentric coordinates (1,0,0)
+#define USE_EPSILON_TEST 1
+// Guigue and Devillers triangle intersection algorithm
+// https://inria.hal.science/inria-00072100/file/RR-4488.pdf
+// https://github.com/erich666/jgt-code/blob/master/Volume_08/Number_1/Guigue2003/tri_tri_intersect.c
+inline __host__ __device__ bool Triangle::Intersect(const Triangle& iT) const {
+	const Point &p1=a, &q1=b, &r1=c, &p2=iT.a, &q2=iT.b, &r2=iT.c;
+	// Compute distance signs of p1, q1 and r1 to the plane of triangle(p2, q2, r2)
+	Point n2 = cross(q2 - p2, r2 - p2);
+	float dp1 = n2 * (p1 - r2);
+	float dq1 = n2 * (q1 - r2);
+	float dr1 = n2 * (r1 - r2);
+
+	// coplanarity robustness check
+#if USE_EPSILON_TEST
+	if (fabsf(dp1) < EPSILON) {dp1 = 0.0;}
+	if (fabsf(dq1) < EPSILON) {dq1 = 0.0;}
+	if (fabsf(dr1) < EPSILON) {dr1 = 0.0;}
+#endif
+	if (dp1 * dq1 > 0.0f && dp1 * dr1 > 0.0f) {
+		return false;
 	}
-	// Check if P in vertex region outside B
-	Point bp = pt - b;
-	float d3 = ab * bp;
-	float d4 = ac * bp;
-	if (d3 >= 0.0f && d4 <= d3) {
-		ptt = b;
-		Point dist = pt - ptt;
-		return dist * dist; // barycentric coordinates (0,1,0)
+
+	// Compute distance signs of p2, q2 and r2 to the plane of triangle(p1, q1, r1)
+	Point n1 = cross(q1 - p1, r1 - p1);
+	float dp2 = n1 * (p2 - r1);
+	float dq2 = n1 * (q2 - r1);
+	float dr2 = n1 * (r2 - r1);
+	// coplanarity robustness check
+#if USE_EPSILON_TEST
+	if (fabsf(dp2) < EPSILON) {dp2 = 0.0;}
+	if (fabsf(dq2) < EPSILON) {dq2 = 0.0;}
+	if (fabsf(dr2) < EPSILON) {dr2 = 0.0;}
+#endif
+	if (dp2 * dq2 > 0.0f && dp2 * dr2 > 0.0f) {
+		return false;
 	}
-	// Check if P in edge region of AB, if so return projection of P onto AB
-	float vc = d1 * d4 - d3 * d2;
-	if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
-		float v = d1 / (d1 - d3);
-		ptt = a + ab*v;
-		Point dist = pt - ptt;
-		return dist * dist; // barycentric coordinates (1-v,v,0)
+
+	const Point *a1=&p1, *b1=&q1, *c1=&r1, *a2=&p2, *b2=&q2, *c2=&r2;
+	float da2=dp2, db2=dq2, dc2=dr2;
+	if (dp1 > 0.0f) {
+		if (dq1 > 0.0f) {
+			a1=&r1; b1=&p1; c1=&q1; b2=&r2; c2=&q2; db2=dr2; dc2=dq2;
+		} else if (dr1 > 0.0f) {
+			a1=&q1; b1=&r1; c1=&p1; b2=&r2; c2=&q2; db2=dr2; dc2=dq2;
+		}
+	} else if (dp1 < 0.0f) {
+		if (dq1 < 0.0f) {
+			a1=&r1; b1=&p1; c1=&q1;
+		} else if (dr1 < 0.0f) {
+			a1=&q1; b1=&r1; c1=&p1;
+		} else {
+			b2=&r2; c2=&q2; db2=dr2; dc2=dq2;
+		}
+	} else {
+		if (dq1 < 0.0f) {
+			if (dr1 >= 0.0f) {
+				a1=&q1; b1=&r1; c1=&p1; b2=&r2; c2=&q2; db2=dr2; dc2=dq2;
+			}
+		} else if (dq1 > 0.0f) {
+			if (dr1 > 0.0f) {
+				b2=&r2; c2=&q2; db2=dr2; dc2=dq2;
+			} else {
+				a1=&q1; b1=&r1; c1=&p1;
+			}
+		} else {
+			if (dr1 > 0.0f) {
+				a1=&r1; b1=&p1; c1=&q1;
+			} else if (dr1 < 0.0f) {
+				a1=&r1; b1=&p1; c1=&q1; b2=&r2; c2=&q2; db2=dr2; dc2=dq2;
+			} else {
+				return coplanar_tri_tri3d(n1, iT);
+			}
+		}
 	}
-	// Check if P in vertex region outside C
-	Point cp = pt - c;
-	float d5 = ab * cp;
-	float d6 = ac * cp;
-	if (d6 >= 0.0f && d5 <= d6) {// barycentric coordinates (0,0,1)
-		ptt = c;
-		Point dist = pt - ptt;
-		return dist * dist;
-	}
-	// Check if P in edge region of AC, if so return projection of P onto AC
-	float vb = d5 * d2 - d1 * d6;
-	if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
-		float w = d2 / (d2 - d6);
-		ptt = a + ac*w;
-		Point dist = pt - ptt;
-		return dist * dist; // barycentric coordinates (1-w,0,w)
-	}
-	// Check if P in edge region of BC, if so return projection of P onto BC
-	float va = d3 * d6 - d5 * d4;
-	if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
-		float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-		ptt = b + (c-b)*w;
-		Point dist = pt - ptt;
-		return dist * dist; // barycentric coordinates (0,1-w,w)
-	}
-	// P inside face region. Compute Q through its barycentric coordinates (u,v,w)
-	float denom = 1.0f / (va + vb + vc);
-	float v = vb * denom;
-	float w = vc * denom;
-	// = u*a + v*b + w*c, u = va * denom = 1.0f - v - w
-	ptt = a + ab*v + ac*w;
-	Point dist = pt - ptt;
-	return dist * dist;
+	return TRI_TRI_3D(*a1, *b1, *c1, *a2, *b2, *c2, da2, db2, dc2);
 }
 
-inline __host__ __device__ bool Triangle::Intersect(const Triangle& r) const {
-	Point pr1, pr2;
-	float local_min;
-	float temp;
-	float s = 0, t = 0;
-	Point p1, p2;
-	local_min = edge_to_edge(a, b, r.a, r.b, s, t, p1, p2);
-	pr1 = p1;
-	pr2 = p2;
-	temp = edge_to_edge(a, c, r.a, r.b, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(c, b, r.a, r.b, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(a, b, r.a, r.c, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(a, c, r.a, r.c, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(c, b, r.a, r.c, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(a, b, r.c, r.b, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(a, c, r.c, r.b, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	temp = edge_to_edge(c, b, r.c, r.b, s, t, p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
+// 共面三角形的2D重叠检测 - 基于Guigue和Devillers算法
+inline __host__ __device__ bool Triangle::coplanar_tri_tri3d(const Point& iNormal, const Triangle& iTri) const {
+	float arrX[2]{iNormal.x, -iNormal.x};
+	float arrY[2]{iNormal.y, -iNormal.y};
+	float arrZ[2]{iNormal.z, -iNormal.z};
+	float n_x = arrX[iNormal.x < 0];
+	float n_y = arrY[iNormal.y < 0];
+	float n_z = arrZ[iNormal.z < 0];
+
+	int maxAxis = 0; // 0 for x, 1 for y, 2 for z
+	if (n_x > n_z) {
+		if (n_x >= n_y) {
+			maxAxis = 0;
+		} else {
+			maxAxis = 1;
+		}
+	} else { // n_z >= n_x
+		if (n_z >= n_y) {
+			maxAxis = 2;
+		} else {
+			maxAxis = 1;
+		}
 	}
 
-	p1 = a;
-	temp = r.point_to_triangle(p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
+	// Projection of the triangles in 3D onto 2D such that the area of the projection is maximized.
+	float points2D[6][2];
+	const Point* points[] = { &a, &b, &c, &iTri.a, &iTri.b, &iTri.c };
+	for (int i = 0; i < sizeof(points)/sizeof(points[0]); ++i) {
+		float coords[3]{ points[i]->x, points[i]->y, points[i]->z };
+		for (int j = 0, k = 0; j < 2; ++j, ++k) {
+			k = k + (j == maxAxis);
+			coords[j] = coords[k];
+		}
+		points2D[i][0] = coords[0];
+		points2D[i][1] = coords[1];
 	}
-	p1 = b;
-	temp = r.point_to_triangle(p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
+	return tri_tri_overlap_test_2d(points2D[0], points2D[3]);
+}
+
+inline __host__ __device__ float Triangle::ORIENT_2D(float a[2], float b[2], float c[2]) const {
+	return (a[0] - c[0]) * (b[1] - c[1]) - (a[1] - c[1]) * (b[0] - c[0]);
+}
+
+inline __host__ __device__ bool Triangle::INTERSECTION_TEST_VERTEX(float P1[2], float Q1[2], float R1[2],
+	float P2[2], float Q2[2], float R2[2]) const
+{
+	if (ORIENT_2D(R2, P2, Q1) >= 0.0f) {
+		if (ORIENT_2D(R2, Q2, Q1) <= 0.0f) {
+			if (ORIENT_2D(P1, P2, Q1) > 0.0f) {
+				return ORIENT_2D(P1, Q2, Q1) <= 0.0f;
+			} else {
+				if (ORIENT_2D(P1, P2, R1) >= 0.0f) {
+					return ORIENT_2D(Q1, R1, P2) >= 0.0f;
+				} else {
+					return false;
+				}
+			}
+		} else {
+			if (ORIENT_2D(P1, Q2, Q1) <= 0.0f) {
+				if (ORIENT_2D(R2, Q2, R1) <= 0.0f) {
+					return ORIENT_2D(Q1, R1, Q2) >= 0.0f;
+				} else {
+					return false;
+				}
+			} else {
+				return false;
+			}
+		}
+	} else {
+		if (ORIENT_2D(R2, P2, R1) >= 0.0f) {
+			if (ORIENT_2D(Q1, R1, R2) >= 0.0f) {
+				return ORIENT_2D(P1, P2, R1) >= 0.0f;
+			} else {
+				if (ORIENT_2D(Q1, R1, Q2) >= 0.0f) {
+					return ORIENT_2D(R2, R1, Q2) >= 0.0f;
+				} else {
+					return false;
+				}
+			}
+		} else {
+			return false;
+		}
 	}
-	p1 = c;
-	temp = r.point_to_triangle(p1, p2);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
+}
+
+inline __host__ __device__ bool Triangle::INTERSECTION_TEST_EDGE(float P1[2], float Q1[2], float R1[2],
+	float P2[2], float Q2[2], float R2[2]) const
+{
+	if (ORIENT_2D(R2, P2, Q1) >= 0.0f) {
+		if (ORIENT_2D(P1, P2, Q1) >= 0.0f) {
+			return ORIENT_2D(P1, Q1, R2) >= 0.0f;
+		} else {
+			if (ORIENT_2D(Q1, R1, P2) >= 0.0f) {
+				return ORIENT_2D(R1, P1, P2) >= 0.0f;
+			} else {
+				return false;
+			}
+		}
+	} else {
+		if (ORIENT_2D(R2, P2, R1) >= 0.0f) {
+			if (ORIENT_2D(P1, P2, R1) >= 0.0f) {
+				if (ORIENT_2D(P1, R1, R2) >= 0.0f) {
+					return true;
+				} else {
+					return ORIENT_2D(Q1, R1, R2) >= 0.0f;
+				}
+			} else {
+				return false;
+			}
+		} else {
+			return false;
+		}
 	}
-	p2 = r.a;
-	temp = point_to_triangle(p2, p1);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
+}
+
+inline __host__ __device__ bool Triangle::ccw_tri_tri_intersection_2d(float p1[2], float q1[2], float r1[2],
+	float p2[2], float q2[2], float r2[2]) const
+{
+	bool edge = false;
+	bool p2q2left = ORIENT_2D(p2, q2, p1) >= 0.0f;
+	bool q2r2left = ORIENT_2D(q2, r2, p1) >= 0.0f;
+	bool r2p2left = ORIENT_2D(r2, p2, p1) >= 0.0f;
+	if (p2q2left) {
+		if (q2r2left) {
+			if (r2p2left) {
+				return true;
+			} else {
+				edge = true;
+			}
+		} else {
+			if (r2p2left) {
+				edge = true;
+				float* temp = r2;
+				r2 = q2; q2 = p2; p2 = temp;
+			}
+		}
+	} else {
+		if (q2r2left) {
+			if (r2p2left) {
+				edge = true;
+			}
+			float* temp = p2;
+			p2 = q2; q2 = r2; r2 = temp;
+		} else {
+			float* temp = r2;
+			r2 = q2; q2 = p2; p2 = temp;
+		}
 	}
-	p2 = r.b;
-	temp = point_to_triangle(p2, p1);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
+
+	if (edge) {
+		return INTERSECTION_TEST_EDGE(p1, q1, r1, p2, q2, r2);
+	} else {
+		return INTERSECTION_TEST_VERTEX(p1, q1, r1, p2, q2, r2);
 	}
-	p2 = r.c;
-	temp = point_to_triangle(p2, p1);
-	if (temp < local_min) {
-		local_min = temp;
-		pr1 = p1;
-		pr2 = p2;
-	}
-	Point dist = pr1 - pr2;
-	return (dist * dist) < EPSILON;
+}
+
+inline __host__ __device__ bool Triangle::tri_tri_overlap_test_2d(float p1[2], float p2[2]) const {
+	int orient1 = (ORIENT_2D(p1, p1 + 2, p1 + 4) < 0.0f) * 2;
+	int orient2 = (ORIENT_2D(p2, p2 + 2, p2 + 4) < 0.0f) * 2;
+	return ccw_tri_tri_intersection_2d(p1, p1+2+orient1, p1+4-orient1, p2, p2+2+orient2, p2+4-orient2);
 }
 
 #endif

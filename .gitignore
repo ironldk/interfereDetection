@@ -339,5 +339,10 @@ ASALocalRun/
 # BeatPulse healthcheck temp database
 healthchecksdb
 
-# .trae folder (excluded from repository)
+# custom excluded from repository
 .trae/
+.roo/
+storage/
+.qdrant-initialized
+.claude/
+imgui.ini
